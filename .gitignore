@@ -1,0 +1,47 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ---- Virtualenvs ----
+env/
+venv/
+.venv/
+ENV/
+
+# ---- Caches / tools ----
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Environment files (NO subir secretos) ----
+.env
+.env.*
+*.env.backup*
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ---- Proyecto (según tu estructura) ----
+cache/
+media/
+
+# Capturas sueltas que se ven en tu carpeta
+mpv-shot*
+
+# Backups que aparecen en tu carpeta
+*.backup
+*.bak
+
+# Logs
+*.log
