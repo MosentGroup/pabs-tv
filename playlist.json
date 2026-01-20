@@ -4,17 +4,8 @@
   "schedule_end": "22:00",
   "show_time": true,
   "items": [
-    {
-      "kind": "image",
-      "src": "media/images/ejemplo.jpg",
-      "duration": 10,
-      "comment": "Coloca tus imágenes en media/images/"
-    },
-    {
-      "kind": "video",
-      "src": "media/videos/ejemplo.mp4",
-      "duration": 30,
-      "comment": "Coloca tus videos en media/videos/"
-    }
+    { "kind": "video", "src": "media/videos/1. MOSENTGROUP.mp4" },
+    { "kind": "video", "src": "media/videos/4. PABS+.mp4" },
+    { "kind": "image", "src": "media/images/LOGO_1.png", "duration": 10 }
   ]
 }
