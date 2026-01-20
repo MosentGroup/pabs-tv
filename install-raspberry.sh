@@ -35,6 +35,46 @@ require_cmd() {
   fi
 }
 
+# Leer default desde .env si existe (sin source para evitar expansión de $)
+env_get() {
+  local key="$1"
+  local file="$2"
+  if [ -f "$file" ]; then
+    # soporta KEY=value o KEY="value"
+    local line
+    line="$(grep -E "^[[:space:]]*${key}=" "$file" | tail -n 1 || true)"
+    if [ -n "$line" ]; then
+      echo "$line" | sed -E "s/^[[:space:]]*${key}=//" | sed -E 's/^"(.*)"$/\1/' | sed -E "s/^'(.*)'\$/\1/"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+ask() {
+  # ask "prompt" "default" -> stdout value
+  local prompt="$1"
+  local def="$2"
+  local out
+  read -r -p "${prompt} [${def}]: " out
+  echo "${out:-$def}"
+}
+
+ask_secret() {
+  # ask_secret "prompt" "default"
+  local prompt="$1"
+  local def="$2"
+  local out
+  echo -n "${prompt} [${def:+(Enter para conservar)}]: "
+  read -r -s out
+  echo ""
+  if [ -z "$out" ]; then
+    echo "$def"
+  else
+    echo "$out"
+  fi
+}
+
 if [ "${EUID}" -eq 0 ]; then
   print_error "No ejecutes este script como root."
   print_info "Ejecuta: bash install-raspberry.sh"
@@ -47,7 +87,7 @@ require_cmd bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-$SCRIPT_DIR}"
 
-# Detectar archivo principal del cliente (sin romper compatibilidad)
+# Detectar cliente (compat)
 CLIENT_MAIN=""
 if [ -f "${INSTALL_DIR}/pabs-tv-client.py" ]; then
   CLIENT_MAIN="pabs-tv-client.py"
@@ -63,14 +103,41 @@ SERVICE_USER="${SERVICE_USER:-$USER}"
 SERVICE_HOME="$(eval echo "~${SERVICE_USER}")"
 SERVICE_UID="$(id -u "${SERVICE_USER}")"
 
+ENV_FILE="${INSTALL_DIR}/.env"
+
 HOSTNAME_SHORT="$(hostname | tr -d '[:space:]')"
-DEFAULT_CLIENT_ID="pabstv-${HOSTNAME_SHORT}"
-DEFAULT_MQTT_HOST="localhost"
-DEFAULT_MQTT_PORT="1883"
-DEFAULT_TOPIC_BASE="pabs-tv"
+
+# Defaults (prioridad: .env existente -> defaults)
+DEFAULT_CLIENT_ID="$(env_get PABS_CLIENT_ID "${ENV_FILE}" || true)"
+DEFAULT_CLIENT_ID="${DEFAULT_CLIENT_ID:-pabstv-${HOSTNAME_SHORT}}"
+
+DEFAULT_MQTT_HOST="$(env_get PABS_MQTT_HOST "${ENV_FILE}" || true)"
+DEFAULT_MQTT_HOST="${DEFAULT_MQTT_HOST:-localhost}"
+
+DEFAULT_MQTT_PORT="$(env_get PABS_MQTT_PORT "${ENV_FILE}" || true)"
+DEFAULT_MQTT_PORT="${DEFAULT_MQTT_PORT:-1883}"
+
+DEFAULT_TOPIC_BASE="$(env_get PABS_TOPIC_BASE "${ENV_FILE}" || true)"
+DEFAULT_TOPIC_BASE="${DEFAULT_TOPIC_BASE:-pabs-tv}"
+
+DEFAULT_MQTT_USER="$(env_get PABS_MQTT_USER "${ENV_FILE}" || true)"
+DEFAULT_MQTT_USER="${DEFAULT_MQTT_USER:-pabs_admin}"
+
+DEFAULT_MQTT_PASS="$(env_get PABS_MQTT_PASS "${ENV_FILE}" || true)"
+DEFAULT_MQTT_PASS="${DEFAULT_MQTT_PASS:-}"
+
+# Defaults Nextcloud sync
+DEFAULT_SYNC_ENABLE="$(env_get PABS_SYNC_ENABLE "${ENV_FILE}" || true)"
+DEFAULT_SYNC_ENABLE="${DEFAULT_SYNC_ENABLE:-0}"
+
+DEFAULT_RCLONE_REMOTE_NAME="$(env_get PABS_RCLONE_REMOTE_NAME "${ENV_FILE}" || true)"
+DEFAULT_RCLONE_REMOTE_NAME="${DEFAULT_RCLONE_REMOTE_NAME:-nextcloud}"
+
+DEFAULT_RCLONE_REMOTE_PATH="$(env_get PABS_RCLONE_REMOTE_PATH "${ENV_FILE}" || true)"
+DEFAULT_RCLONE_REMOTE_PATH="${DEFAULT_RCLONE_REMOTE_PATH:-pabs-tv/media}"
 
 clear
-print_header "INSTALADOR DE PABS-TV"
+print_header "INSTALADOR DE PABS-TV (con Nextcloud sync integrado)"
 echo ""
 echo "Directorio del proyecto: ${INSTALL_DIR}"
 echo "Archivo cliente:         ${CLIENT_MAIN}"
@@ -85,24 +152,17 @@ if [[ ! "${REPLY}" =~ ^[Ss]$ ]]; then
 fi
 
 echo ""
-read -r -p "PABS_CLIENT_ID [${DEFAULT_CLIENT_ID}]: " PABS_CLIENT_ID_INPUT
-PABS_CLIENT_ID="${PABS_CLIENT_ID_INPUT:-$DEFAULT_CLIENT_ID}"
+PABS_CLIENT_ID="$(ask "PABS_CLIENT_ID" "${DEFAULT_CLIENT_ID}")"
+PABS_MQTT_HOST="$(ask "PABS_MQTT_HOST" "${DEFAULT_MQTT_HOST}")"
+PABS_MQTT_PORT="$(ask "PABS_MQTT_PORT" "${DEFAULT_MQTT_PORT}")"
+PABS_TOPIC_BASE="$(ask "PABS_TOPIC_BASE" "${DEFAULT_TOPIC_BASE}")"
+PABS_MQTT_USER="$(ask "PABS_MQTT_USER" "${DEFAULT_MQTT_USER}")"
+PABS_MQTT_PASS="$(ask_secret "PABS_MQTT_PASS" "${DEFAULT_MQTT_PASS}")"
 
-read -r -p "PABS_MQTT_HOST [${DEFAULT_MQTT_HOST}]: " MQTT_HOST_INPUT
-PABS_MQTT_HOST="${MQTT_HOST_INPUT:-$DEFAULT_MQTT_HOST}"
-
-read -r -p "PABS_MQTT_PORT [${DEFAULT_MQTT_PORT}]: " MQTT_PORT_INPUT
-PABS_MQTT_PORT="${MQTT_PORT_INPUT:-$DEFAULT_MQTT_PORT}"
-
-read -r -p "PABS_TOPIC_BASE [${DEFAULT_TOPIC_BASE}]: " TOPIC_BASE_INPUT
-PABS_TOPIC_BASE="${TOPIC_BASE_INPUT:-$DEFAULT_TOPIC_BASE}"
-
-# Detectar sesión (informativo). En Wayland suele haber DISPLAY=:0 por XWayland.
+# Detectar sesión (informativo)
 SESSION_TYPE="${XDG_SESSION_TYPE:-unknown}"
 DISPLAY_CAND="${DISPLAY:-:0}"
 WAYLAND_DISPLAY_CAND="${WAYLAND_DISPLAY:-wayland-0}"
-
-echo ""
 print_info "Sesión detectada (informativa): XDG_SESSION_TYPE=${SESSION_TYPE}, DISPLAY=${DISPLAY_CAND}, WAYLAND_DISPLAY=${WAYLAND_DISPLAY_CAND}"
 
 print_header "PASO 1: Actualizando sistema"
@@ -123,11 +183,12 @@ PACKAGES=(
   curl
   wget
   x11-xserver-utils
+  flock
 )
 sudo apt install -y "${PACKAGES[@]}"
 print_success "Paquetes base instalados"
 
-# Si MQTT es localhost, ofrecer instalar broker mosquitto (para evitar “host offline” por no tener broker)
+# Si MQTT es localhost, ofrecer broker mosquitto
 if [[ "${PABS_MQTT_HOST}" == "localhost" || "${PABS_MQTT_HOST}" == "127.0.0.1" ]]; then
   echo ""
   read -r -p "MQTT host es local. ¿Instalar/activar mosquitto broker en este equipo? (s/n) " -n 1 REPLY
@@ -142,6 +203,7 @@ if [[ "${PABS_MQTT_HOST}" == "localhost" || "${PABS_MQTT_HOST}" == "127.0.0.1" ]
   fi
 fi
 
+# yt-dlp
 if command -v yt-dlp >/dev/null 2>&1; then
   print_success "yt-dlp ya está instalado"
 else
@@ -149,23 +211,6 @@ else
   sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
   sudo chmod a+rx /usr/local/bin/yt-dlp
   print_success "yt-dlp instalado"
-fi
-
-echo ""
-read -r -p "¿Deseas instalar rclone para sincronización (Nextcloud/Drive/etc.)? (s/n) " -n 1 REPLY
-echo ""
-INSTALL_RCLONE="0"
-if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
-  INSTALL_RCLONE="1"
-  if command -v rclone >/dev/null 2>&1; then
-    print_success "rclone ya está instalado"
-  else
-    print_info "Instalando rclone..."
-    curl https://rclone.org/install.sh | sudo bash
-    print_success "rclone instalado"
-  fi
-else
-  print_info "Saltando rclone"
 fi
 
 print_header "PASO 3: Estructura de carpetas"
@@ -199,127 +244,110 @@ print_success "Dependencias Python instaladas"
 print_header "PASO 5: Detección REAL de MPV (evitar x11 si no existe)"
 require_cmd mpv
 
-# Listas reales soportadas por MPV (esto evita tu error: gpu-context=x11 isn't supported)
 MPV_VO_HELP="$(mpv --vo=help 2>/dev/null || true)"
 MPV_GPUCTX_HELP="$(mpv --gpu-context=help 2>/dev/null || true)"
 
-has_vo() {
-  local v="$1"
-  echo "${MPV_VO_HELP}" | grep -qiE "(^|[[:space:]])${v}($|[[:space:]])"
-}
-has_gpuctx() {
-  local g="$1"
-  echo "${MPV_GPUCTX_HELP}" | grep -qiE "(^|[[:space:]])${g}($|[[:space:]])"
-}
+has_vo() { echo "${MPV_VO_HELP}" | grep -qiE "(^|[[:space:]])${1}($|[[:space:]])"; }
+has_gpuctx() { echo "${MPV_GPUCTX_HELP}" | grep -qiE "(^|[[:space:]])${1}($|[[:space:]])"; }
 
-# Preferencias:
-# - Si hay Wayland disponible Y mpv soporta wayland: usar gpu/wayland
-# - Si no, preferir drm si existe (ideal para systemd sin sesión gráfica)
-# - Si no, no forzar (mpv decide)
 MPV_VO=""
 MPV_GPU_CONTEXT=""
 PABS_DISPLAY_ENV=""
 PABS_WAYLAND_ENV="0"
 
-# ¿Existe runtime dir en este momento?
 RUNTIME_DIR="/run/user/${SERVICE_UID}"
 WAYLAND_SOCKET="${RUNTIME_DIR}/${WAYLAND_DISPLAY_CAND}"
 
 HAS_WAYLAND_SOCKET="0"
-if [ -S "${WAYLAND_SOCKET}" ]; then
-  HAS_WAYLAND_SOCKET="1"
-fi
+if [ -S "${WAYLAND_SOCKET}" ]; then HAS_WAYLAND_SOCKET="1"; fi
 
-# ¿Es “usable” X11 desde este script? (a veces sí, pero MPV puede no tener x11 igual)
 HAS_X11="0"
 if command -v xset >/dev/null 2>&1; then
-  if sudo -u "${SERVICE_USER}" env \
-      DISPLAY="${DISPLAY_CAND}" \
-      XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
-      xset q >/dev/null 2>&1; then
+  if sudo -u "${SERVICE_USER}" env DISPLAY="${DISPLAY_CAND}" XDG_RUNTIME_DIR="${RUNTIME_DIR}" xset q >/dev/null 2>&1; then
     HAS_X11="1"
   fi
 fi
 
-# Decidir configuración final basada en lo que MPV soporta
 if [ "${HAS_WAYLAND_SOCKET}" = "1" ] && has_vo "gpu" && has_gpuctx "wayland"; then
   MPV_VO="gpu"
   MPV_GPU_CONTEXT="wayland"
   PABS_WAYLAND_ENV="1"
-  PABS_DISPLAY_ENV="${DISPLAY_CAND}"  # por si tu app lo usa, pero el vo/gpuctx será wayland
-  print_success "MPV soporta Wayland. Config: vo=gpu, gpu-context=wayland (WAYLAND socket detectado)"
+  PABS_DISPLAY_ENV="${DISPLAY_CAND}"
+  print_success "MPV soporta Wayland: vo=gpu, gpu-context=wayland"
 elif [ -e /dev/dri/card0 ] && has_vo "drm"; then
   MPV_VO="drm"
-  MPV_GPU_CONTEXT=""   # drm no necesita gpu-context x11/wayland
+  MPV_GPU_CONTEXT=""
   PABS_WAYLAND_ENV="0"
-  PABS_DISPLAY_ENV=""  # no depender de DISPLAY
-  print_success "Config robusta sin sesión gráfica: vo=drm (KMS/DRM)"
+  PABS_DISPLAY_ENV=""
+  print_success "Config robusta sin sesión gráfica: vo=drm"
 elif [ "${HAS_X11}" = "1" ] && has_vo "x11" && has_gpuctx "x11"; then
   MPV_VO="x11"
   MPV_GPU_CONTEXT="x11"
   PABS_WAYLAND_ENV="0"
   PABS_DISPLAY_ENV="${DISPLAY_CAND}"
-  print_success "MPV soporta X11. Config: vo=x11, gpu-context=x11 (DISPLAY=${DISPLAY_CAND})"
+  print_success "MPV soporta X11: vo=x11, gpu-context=x11"
 else
-  # No forzar nada (evita exactamente tu error)
   MPV_VO=""
   MPV_GPU_CONTEXT=""
   PABS_WAYLAND_ENV="0"
   PABS_DISPLAY_ENV="${DISPLAY_CAND}"
-  print_warning "No se encontró una combinación segura para forzar VO/GPUCTX. Se deja vacío para que mpv decida."
-  print_info "Esto evita errores tipo: gpu-context 'x11' isn't supported."
+  print_warning "No se encontró combinación segura para forzar VO/GPUCTX. Se deja vacío (mpv decide)."
 fi
 
 print_info "Resumen MPV: PABS_MPV_VO='${MPV_VO}'  PABS_MPV_GPU_CONTEXT='${MPV_GPU_CONTEXT}'"
 
-print_header "PASO 6: Variables de entorno (.env) y playlist"
-ENV_FILE="${INSTALL_DIR}/.env"
+print_header "PASO 6: Escribiendo .env (se sobrescribe)"
 backup_file "${ENV_FILE}"
 
+# Escribimos valores entre comillas para evitar problemas con $ y espacios
 cat > "${ENV_FILE}" <<EOF
 # Identificación
-PABS_CLIENT_ID=${PABS_CLIENT_ID}
+PABS_CLIENT_ID="${PABS_CLIENT_ID}"
 
 # MQTT
-PABS_MQTT_HOST=${PABS_MQTT_HOST}
-PABS_MQTT_PORT=${PABS_MQTT_PORT}
-PABS_MQTT_USER=pabs_admin
-PABS_MQTT_PASS=58490Ged$$kgd-op3EdEB
-PABS_TOPIC_BASE=${PABS_TOPIC_BASE}
+PABS_MQTT_HOST="${PABS_MQTT_HOST}"
+PABS_MQTT_PORT="${PABS_MQTT_PORT}"
+PABS_MQTT_USER="${PABS_MQTT_USER}"
+PABS_MQTT_PASS="${PABS_MQTT_PASS}"
+PABS_TOPIC_BASE="${PABS_TOPIC_BASE}"
 
 # Paths
-PABS_PROJECT_DIR=${INSTALL_DIR}
-PABS_MEDIA_DIR=${INSTALL_DIR}/media
-PABS_PLAYLIST_FILE=${INSTALL_DIR}/playlist.json
-PABS_CACHE_DIR=${INSTALL_DIR}/cache
+PABS_PROJECT_DIR="${INSTALL_DIR}"
+PABS_MEDIA_DIR="${INSTALL_DIR}/media"
+PABS_PLAYLIST_FILE="${INSTALL_DIR}/playlist.json"
+PABS_CACHE_DIR="${INSTALL_DIR}/cache"
 
 # Logs
-PABS_LOGFILE=/tmp/pabs-tv-client.log
-PABS_MPV_LOGFILE=/tmp/mpv.log
+PABS_LOGFILE="/tmp/pabs-tv-client.log"
+PABS_MPV_LOGFILE="/tmp/mpv.log"
 
 # Display (informativo; si el servicio usa DRM puede ir vacío)
 EOF
 
 if [ -n "${PABS_DISPLAY_ENV}" ]; then
-  echo "DISPLAY=${PABS_DISPLAY_ENV}" >> "${ENV_FILE}"
+  echo "DISPLAY=\"${PABS_DISPLAY_ENV}\"" >> "${ENV_FILE}"
 fi
 
 if [ "${PABS_WAYLAND_ENV}" = "1" ]; then
   {
-    echo "XDG_SESSION_TYPE=wayland"
-    echo "WAYLAND_DISPLAY=${WAYLAND_DISPLAY_CAND}"
+    echo "XDG_SESSION_TYPE=\"wayland\""
+    echo "WAYLAND_DISPLAY=\"${WAYLAND_DISPLAY_CAND}\""
   } >> "${ENV_FILE}"
 fi
 
 cat >> "${ENV_FILE}" <<EOF
 
-# MPV (NO forzar x11 si tu MPV no lo soporta)
-# Si están vacíos, tu app/mpv decide.
-PABS_MPV_VO=${MPV_VO}
-PABS_MPV_GPU_CONTEXT=${MPV_GPU_CONTEXT}
-PABS_MPV_HWDEC=no
-PABS_MPV_YTDL_FORMAT=bestvideo[height<=720]+bestaudio/best/best
-PABS_MPV_EXTRA_OPTS=
+# MPV
+PABS_MPV_VO="${MPV_VO}"
+PABS_MPV_GPU_CONTEXT="${MPV_GPU_CONTEXT}"
+PABS_MPV_HWDEC="no"
+PABS_MPV_YTDL_FORMAT="bestvideo[height<=720]+bestaudio/best/best"
+PABS_MPV_EXTRA_OPTS=""
+
+# Nextcloud / rclone sync (si habilitas)
+PABS_SYNC_ENABLE="0"
+PABS_RCLONE_REMOTE_NAME="nextcloud"
+PABS_RCLONE_REMOTE_PATH="pabs-tv/media"
 EOF
 
 print_success ".env escrito: ${ENV_FILE}"
@@ -343,67 +371,158 @@ else
   print_success "playlist.json ya existe (no se modifica)"
 fi
 
-print_header "PASO 6.1 (Opcional): Sincronización automática de media con rclone (cada 30 min)"
+print_header "PASO 6.1: Nextcloud Sync (integrado) - opcional"
+echo ""
+print_info "Si habilitas esto, se sincroniza ${INSTALL_DIR}/media cada 30 min con rclone."
+print_info "Regla: si rclone ya tiene el remote 'nextcloud:', se salta la configuración."
+echo ""
+read -r -p "¿Habilitar sync automático con Nextcloud (rclone) cada 30 min? (s/n) " -n 1 REPLY
+echo ""
+
 SYNC_ENABLED="0"
-RCLONE_REMOTE_PATH=""
-if [ "${INSTALL_RCLONE}" = "1" ]; then
-  echo ""
-  print_info "Para que se copien videos/imágenes automáticamente, necesitas un remote configurado en rclone."
-  print_info "Ejemplos: nextcloud:TV_MEDIA  |  gdrive:carpeta/pabs"
-  echo ""
-  read -r -p "¿Configurar sync automático de media con rclone cada 30 min? (s/n) " -n 1 REPLY
-  echo ""
-  if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
-    SYNC_ENABLED="1"
-    read -r -p "Ruta remota rclone (ej: nextcloud:TV_MEDIA): " RCLONE_REMOTE_PATH
-    if [ -z "${RCLONE_REMOTE_PATH}" ]; then
-      print_warning "No diste ruta remota. Se omite sync."
+if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
+  SYNC_ENABLED="1"
+
+  # instalar rclone si falta
+  if command -v rclone >/dev/null 2>&1; then
+    print_success "rclone ya está instalado"
+  else
+    print_info "Instalando rclone..."
+    curl https://rclone.org/install.sh | sudo bash
+    print_success "rclone instalado"
+  fi
+
+  # verificar remote nextcloud
+  if rclone listremotes 2>/dev/null | grep -q "^nextcloud:$"; then
+    print_success "Remote rclone 'nextcloud:' ya existe. Saltando rclone config."
+  else
+    print_warning "No existe remote 'nextcloud:'. Se abrirá 'rclone config' para crearlo."
+    echo ""
+    print_info "Pasos sugeridos (WebDAV/Nextcloud):"
+    echo "  1) n (New remote)"
+    echo "  2) Nombre: nextcloud"
+    echo "  3) Tipo: WebDAV"
+    echo "  4) URL: https://TU_NEXTCLOUD/remote.php/dav/files/TU_USUARIO/"
+    echo "  5) Vendor: Nextcloud"
+    echo "  6) Usuario + contraseña/token"
+    echo "  7) q para salir"
+    echo ""
+    read -r -p "Presiona Enter para abrir rclone config..." _
+    rclone config
+    if ! rclone listremotes 2>/dev/null | grep -q "^nextcloud:$"; then
+      print_error "No se encontró la configuración 'nextcloud:' luego de rclone config. No se habilita sync."
       SYNC_ENABLED="0"
+    else
+      print_success "Remote 'nextcloud:' configurado"
     fi
   fi
-fi
 
-SYNC_SCRIPT="${INSTALL_DIR}/scripts/sync-media.sh"
-cat > "${SYNC_SCRIPT}" <<EOF
-#!/bin/bash
+  if [ "${SYNC_ENABLED}" = "1" ]; then
+    RCLONE_REMOTE_PATH="$(ask "Ruta remota dentro de nextcloud (REMOTE_PATH)" "${DEFAULT_RCLONE_REMOTE_PATH}")"
+    # guardar en .env (sin romper otras vars)
+    # Reescribimos solo estas 3 claves de sync al final del archivo
+    # (simple: remover líneas previas y agregar nuevas)
+    tmp_env="${ENV_FILE}.tmp.$$"
+    grep -vE '^(PABS_SYNC_ENABLE|PABS_RCLONE_REMOTE_NAME|PABS_RCLONE_REMOTE_PATH)=' "${ENV_FILE}" > "${tmp_env}"
+    cat >> "${tmp_env}" <<EOF
+
+PABS_SYNC_ENABLE="1"
+PABS_RCLONE_REMOTE_NAME="nextcloud"
+PABS_RCLONE_REMOTE_PATH="${RCLONE_REMOTE_PATH}"
+EOF
+    mv "${tmp_env}" "${ENV_FILE}"
+    print_success ".env actualizado con sync Nextcloud"
+
+    # Crear script sync (basado en tu sync-nextcloud.sh pero usando PABS_* del EnvironmentFile)
+    SYNC_SCRIPT="${INSTALL_DIR}/scripts/sync-nextcloud.sh"
+    cat > "${SYNC_SCRIPT}" <<'EOF'
+#!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE="${RCLONE_REMOTE_PATH}"
-DEST="${INSTALL_DIR}/media"
-LOG="/tmp/pabs-tv-rclone.log"
+# Lee variables desde systemd EnvironmentFile (.env) porque el service lo carga.
+# Variables esperadas:
+#   PABS_RCLONE_REMOTE_NAME (default: nextcloud)
+#   PABS_RCLONE_REMOTE_PATH (default: pabs-tv/media)
+#   PABS_PROJECT_DIR (default: /home/.../pabs-tv)
+#   PABS_MEDIA_DIR (default: $PABS_PROJECT_DIR/media)
 
-if [ -z "\${REMOTE}" ]; then
-  echo "[sync-media] REMOTE vacío. Edita ${ENV_FILE} o el timer/script." >> "\${LOG}"
+REMOTE_NAME="${PABS_RCLONE_REMOTE_NAME:-nextcloud}"
+REMOTE_PATH="${PABS_RCLONE_REMOTE_PATH:-pabs-tv/media}"
+PROJECT_DIR="${PABS_PROJECT_DIR:-/home/pabstvroot/pabs-tv}"
+LOCAL_MEDIA_DIR="${PABS_MEDIA_DIR:-${PROJECT_DIR}/media}"
+
+LOG_FILE="${PABS_RCLONE_LOG_FILE:-${PROJECT_DIR}/cron-sync.log}"
+LOCK_FILE="${PABS_RCLONE_LOCK_FILE:-/tmp/pabs-tv-nextcloud-sync.lock}"
+
+RCLONE_BIN="$(command -v rclone || true)"
+DATE_BIN="$(command -v date || true)"
+
+if [[ -z "${RCLONE_BIN}" ]]; then
+  echo "[ERROR] rclone no está instalado o no está en PATH" >&2
+  exit 1
+fi
+
+mkdir -p "${LOCAL_MEDIA_DIR}" "$(dirname "${LOG_FILE}")"
+
+log() {
+  echo "[${DATE_BIN:+$(${DATE_BIN} '+%Y-%m-%d %H:%M:%S')}] $*" | tee -a "${LOG_FILE}"
+}
+
+# Evitar ejecuciones simultáneas
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  log "[WARN] Ya hay una sincronización corriendo. Saliendo."
   exit 0
 fi
 
-# Sync completo a media/ (incluye videos/ e images/ si existen en el remoto)
-# Ajusta filtros si quieres: --include "videos/**" --include "images/**" --exclude "*"
-rclone sync "\${REMOTE}" "\${DEST}" \
+# Verificar remote
+if ! rclone listremotes | grep -q "^${REMOTE_NAME}:$"; then
+  log "[ERROR] Remote '${REMOTE_NAME}:' no configurado en rclone"
+  exit 1
+fi
+
+REMOTE_FULL="${REMOTE_NAME}:${REMOTE_PATH}"
+
+log "==== Sync START ===="
+log "Remote: ${REMOTE_FULL}"
+log "Local : ${LOCAL_MEDIA_DIR}"
+
+mkdir -p "${LOCAL_MEDIA_DIR}/videos" "${LOCAL_MEDIA_DIR}/images"
+
+# Sync completo a media/ (incluye videos/ e images/)
+"${RCLONE_BIN}" sync "${REMOTE_FULL}" "${LOCAL_MEDIA_DIR}" \
   --create-empty-src-dirs \
-  --checksum \
-  --fast-list \
   --transfers 4 \
   --checkers 8 \
+  --timeout 30s \
+  --contimeout 15s \
+  --retries 3 \
+  --low-level-retries 10 \
+  --stats 30s \
   --log-level INFO \
-  --log-file "\${LOG}"
+  --log-file "${LOG_FILE}"
 
-chown -R ${SERVICE_USER}:${SERVICE_USER} "\${DEST}" >/dev/null 2>&1 || true
+log "==== Sync END ===="
+log "Local totals:"
+find "${LOCAL_MEDIA_DIR}" -type f | wc -l | xargs -I{} log "  files: {}"
+log ""
 EOF
-chmod +x "${SYNC_SCRIPT}"
-sudo chown "${SERVICE_USER}:${SERVICE_USER}" "${SYNC_SCRIPT}" || true
 
-if [ "${SYNC_ENABLED}" = "1" ]; then
-  print_info "Creando service/timer systemd para sync cada 30 min..."
-  SYNC_SERVICE="/etc/systemd/system/pabs-tv-media-sync.service"
-  SYNC_TIMER="/etc/systemd/system/pabs-tv-media-sync.timer"
+    chmod +x "${SYNC_SCRIPT}"
+    sudo chown "${SERVICE_USER}:${SERVICE_USER}" "${SYNC_SCRIPT}" || true
+    print_success "Script de sync creado: ${SYNC_SCRIPT}"
 
-  backup_file "${SYNC_SERVICE}"
-  backup_file "${SYNC_TIMER}"
+    # systemd timer/service
+    print_info "Creando/actualizando service/timer systemd (cada 30 min)..."
+    SYNC_SERVICE="/etc/systemd/system/pabs-tv-media-sync.service"
+    SYNC_TIMER="/etc/systemd/system/pabs-tv-media-sync.timer"
 
-  sudo tee "${SYNC_SERVICE}" >/dev/null <<EOF
+    backup_file "${SYNC_SERVICE}"
+    backup_file "${SYNC_TIMER}"
+
+    sudo tee "${SYNC_SERVICE}" >/dev/null <<EOF
 [Unit]
-Description=PABS-TV Media Sync (rclone)
+Description=PABS-TV Media Sync (rclone nextcloud)
 After=network-online.target
 Wants=network-online.target
 
@@ -411,11 +530,12 @@ Wants=network-online.target
 Type=oneshot
 User=${SERVICE_USER}
 WorkingDirectory=${INSTALL_DIR}
+EnvironmentFile=${ENV_FILE}
 Environment="HOME=${SERVICE_HOME}"
 ExecStart=${SYNC_SCRIPT}
 EOF
 
-  sudo tee "${SYNC_TIMER}" >/dev/null <<EOF
+    sudo tee "${SYNC_TIMER}" >/dev/null <<EOF
 [Unit]
 Description=Run PABS-TV Media Sync every 30 minutes
 
@@ -429,21 +549,27 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now pabs-tv-media-sync.timer
-  print_success "Sync habilitado: pabs-tv-media-sync.timer (cada 30 min)"
-  print_info "Log sync: tail -n 200 /tmp/pabs-tv-rclone.log"
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now pabs-tv-media-sync.timer
+    print_success "Sync habilitado: pabs-tv-media-sync.timer"
+
+    echo ""
+    read -r -p "¿Ejecutar una sincronización ahora (bajar media)? (s/n) " -n 1 REPLY
+    echo ""
+    if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
+      print_info "Ejecutando sync ahora..."
+      sudo -u "${SERVICE_USER}" env HOME="${SERVICE_HOME}" bash "${SYNC_SCRIPT}" || true
+      print_success "Sync manual terminado (revisa log si hubo errores)"
+      print_info "Log: tail -n 200 ${INSTALL_DIR}/cron-sync.log"
+    fi
+  fi
 else
-  print_info "Sync de media no habilitado (puedes habilitarlo luego)."
+  print_info "Sync Nextcloud no habilitado."
 fi
 
-print_header "PASO 7: Servicio systemd (se sobrescribe si existe)"
+print_header "PASO 7: Servicio systemd del cliente (se sobrescribe si existe)"
 SERVICE_FILE="/etc/systemd/system/pabs-tv.service"
 backup_file "${SERVICE_FILE}"
-
-# Nota: Para no depender de sesión gráfica, el servicio funciona perfecto con vo=drm.
-# Si tu caso es Wayland y quieres salida por Wayland desde systemd, normalmente debes correr como servicio de usuario (systemd --user).
-# Aun así, dejamos variables por si tu app las usa.
 
 sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
@@ -497,8 +623,8 @@ echo "Siguientes pasos:"
 echo "1) Revisa .env:                 nano ${ENV_FILE}"
 echo "2) Revisa playlist:             nano ${INSTALL_DIR}/playlist.json"
 echo "3) Ver logs servicio:           journalctl -u pabs-tv.service -f"
-echo "4) Ver logs mpv (si tu app lo usa): tail -n 200 /tmp/mpv.log"
+echo "4) Ver logs mpv:                tail -n 200 /tmp/mpv.log"
 echo "5) Si habilitaste sync:         systemctl status pabs-tv-media-sync.timer"
-echo "                                tail -n 200 /tmp/pabs-tv-rclone.log"
+echo "                                tail -n 200 ${INSTALL_DIR}/cron-sync.log"
 echo ""
 print_success "Listo"
