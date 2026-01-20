@@ -3,15 +3,15 @@
   "schedule_start": "08:00",
   "schedule_end": "22:00",
   "show_time": true,
-  "list": [
+  "items": [
     {
-      "type": "image",
+      "kind": "image",
       "src": "media/images/ejemplo.jpg",
       "duration": 10,
       "comment": "Coloca tus imágenes en media/images/"
     },
     {
-      "type": "video",
+      "kind": "video",
       "src": "media/videos/ejemplo.mp4",
       "duration": 30,
       "comment": "Coloca tus videos en media/videos/"

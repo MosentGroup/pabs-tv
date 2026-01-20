@@ -1,24 +1,40 @@
 #!/usr/bin/env python3
-import json, time, os, signal, subprocess, shutil, random, sys, threading
-from pathlib import Path
-import socket
-import queue
-import os
-import tempfile
-from datetime import datetime, time as dt_time
-
+import json
 import logging
+import os
+import queue
+import random
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, time as dt_time
 from logging.handlers import RotatingFileHandler
-# Configuración robusta de logging: usa RotatingFileHandler para limitar el tamaño del log
-# Máximo 10MB por archivo, mantiene 2 backups (total ~30MB máximo)
-log_file = os.environ.get("PABS_LOGFILE") or os.path.join(tempfile.gettempdir(), "pabs-tv-client.log")
+from pathlib import Path
+
+# ----------------------------
+# Logging
+# ----------------------------
+def _env_get(keys, default=None):
+    for k in keys:
+        v = os.environ.get(k)
+        if v is not None and str(v).strip() != "":
+            return v
+    return default
+
+
+LOG_FILE = _env_get(["PABS_LOGFILE", "PABS_LOG_FILE", "PABS_LOG_PATH"], os.path.join(tempfile.gettempdir(), "pabs-tv-client.log"))
 handlers = []
+
 try:
-    fh = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=2)
-    fh.setLevel(logging.INFO)  # Solo INFO en archivo para reducir tamaño
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=2)
+    fh.setLevel(logging.INFO)
     handlers.append(fh)
 except Exception:
-    # No detener la aplicación si no se puede crear el archivo de log
     pass
 
 sh = logging.StreamHandler(sys.stdout)
@@ -26,60 +42,79 @@ sh.setLevel(logging.DEBUG)
 handlers.append(sh)
 
 logging.basicConfig(
-    level=logging.DEBUG,  # nivel raíz (puedes cambiar a INFO si quieres menos verbosidad)
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=handlers,
 )
-logging.getLogger().setLevel(logging.DEBUG)
+log = logging.getLogger("pabs-tv")
 
+
+# ----------------------------
+# dotenv (optional)
+# ----------------------------
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()
+    base_guess = Path(__file__).resolve().parent
+    load_dotenv(dotenv_path=str(base_guess / ".env"), override=False)
 except Exception:
-    logging.getLogger().warning("python-dotenv no instalado; continuando sin .env")
+    pass
 
-# ==== CONFIG BÁSICA ====
+
+# ----------------------------
+# Config
+# ----------------------------
 HOSTNAME = socket.gethostname()
-# Si PABS_CLIENT_ID está definido, usarlo; si no, generar uno único con hostname y timestamp
-if os.environ.get("PABS_CLIENT_ID"):
-    CLIENT_ID = os.environ.get("PABS_CLIENT_ID")
-else:
-    # Generar ID único para evitar conflictos: sala-01-HOSTNAME-PID
+CLIENT_ID = _env_get(["PABS_CLIENT_ID", "CLIENT_ID"], None)
+if not CLIENT_ID:
     CLIENT_ID = f"sala-01-{HOSTNAME}-{os.getpid()}"
-MQTT_HOST = os.environ.get("PABS_MQTT_HOST", "localhost")
-MQTT_PORT = int(os.environ.get("PABS_MQTT_PORT", "1883"))
-MQTT_USER = os.environ.get("PABS_MQTT_USER", "") or None
-MQTT_PASS = os.environ.get("PABS_MQTT_PASS", "") or None
-TOPIC_CMD     = f"pabs-tv/{CLIENT_ID}/cmd"
-TOPIC_STATUS  = f"pabs-tv/{CLIENT_ID}/status"
-TOPIC_NOWPLAY = f"pabs-tv/{CLIENT_ID}/now_playing"
 
-# ==== RUTAS DE MEDIOS ====
-# Detectar usuario actual y construir rutas base
-CURRENT_USER = os.environ.get("USER") or os.environ.get("USERNAME") or "pi"
-BASE_MEDIA_DIR = Path(os.environ.get("PABS_MEDIA_DIR", f"/home/{CURRENT_USER}/pabs-tv"))
-MEDIA_VIDEO_DIR = BASE_MEDIA_DIR / "media" / "videos"
-MEDIA_IMAGE_DIR = BASE_MEDIA_DIR / "media" / "images"
+MQTT_HOST = _env_get(["PABS_MQTT_HOST", "MQTT_BROKER", "MQTT_HOST"], "localhost")
+MQTT_PORT = int(_env_get(["PABS_MQTT_PORT", "MQTT_PORT"], "1883"))
+MQTT_USER = _env_get(["PABS_MQTT_USER", "MQTT_USER", "MQTT_USERNAME"], "") or None
+MQTT_PASS = _env_get(["PABS_MQTT_PASS", "MQTT_PASSWORD", "MQTT_PASS"], "") or None
+TOPIC_BASE = _env_get(["PABS_TOPIC_BASE", "MQTT_TOPIC_BASE"], "pabs-tv").strip().strip("/")
 
-DEFAULT_PLAYLIST_FILE = BASE_MEDIA_DIR / "playlist.json"
-CACHE_DIR = BASE_MEDIA_DIR / "cache"
+TOPIC_CMD = f"{TOPIC_BASE}/{CLIENT_ID}/cmd"
+TOPIC_STATUS = f"{TOPIC_BASE}/{CLIENT_ID}/status"
+TOPIC_NOWPLAY = f"{TOPIC_BASE}/{CLIENT_ID}/now_playing"
 
-logging.info("===== CONFIGURACIÓN DEL CLIENTE =====")
-logging.info("MQTT_HOST: %s", MQTT_HOST)
-logging.info("MQTT_PORT: %s", MQTT_PORT)
-logging.info("TOPIC: %s", TOPIC_CMD)
-logging.info("CLIENT_ID: %s", CLIENT_ID)
-logging.info("CURRENT_USER: %s", CURRENT_USER)
-logging.info("BASE_MEDIA_DIR: %s", BASE_MEDIA_DIR)
-logging.info("MEDIA_VIDEO_DIR: %s", MEDIA_VIDEO_DIR)
-logging.info("MEDIA_IMAGE_DIR: %s", MEDIA_IMAGE_DIR)
-logging.info(f"PLAYLIST_FILE: {DEFAULT_PLAYLIST_FILE}")
+PROJECT_DIR = Path(_env_get(["PABS_PROJECT_DIR"], str(Path(__file__).resolve().parent))).expanduser().resolve()
+MEDIA_DIR = Path(_env_get(["PABS_MEDIA_DIR", "MEDIA_DIR"], str(PROJECT_DIR / "media"))).expanduser()
+PLAYLIST_FILE = Path(_env_get(["PABS_PLAYLIST_FILE"], str(PROJECT_DIR / "playlist.json"))).expanduser()
+CACHE_DIR = Path(_env_get(["PABS_CACHE_DIR"], str(PROJECT_DIR / "cache"))).expanduser()
 
-logging.info("=====================================")
+MEDIA_VIDEO_DIR = MEDIA_DIR / "videos"
+MEDIA_IMAGE_DIR = MEDIA_DIR / "images"
+for p in (MEDIA_VIDEO_DIR, MEDIA_IMAGE_DIR, CACHE_DIR):
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
-# ==== MPV ====
+log.info("===== CONFIG =====")
+log.info("CLIENT_ID: %s", CLIENT_ID)
+log.info("MQTT: %s:%s", MQTT_HOST, MQTT_PORT)
+log.info("TOPIC_CMD: %s", TOPIC_CMD)
+log.info("PROJECT_DIR: %s", PROJECT_DIR)
+log.info("MEDIA_DIR: %s", MEDIA_DIR)
+log.info("PLAYLIST_FILE: %s", PLAYLIST_FILE)
+log.info("CACHE_DIR: %s", CACHE_DIR)
+log.info("DISPLAY: %s", os.environ.get("DISPLAY"))
+log.info("WAYLAND_DISPLAY: %s", os.environ.get("WAYLAND_DISPLAY"))
+log.info("==================")
+
+# ----------------------------
+# MPV
+# ----------------------------
 MPV = shutil.which("mpv") or "/usr/bin/mpv"
+MPV_LOG = _env_get(["PABS_MPV_LOGFILE"], "/tmp/mpv.log")
+MPV_YTDL_FORMAT = _env_get(["PABS_MPV_YTDL_FORMAT"], "bestvideo[height<=720]+bestaudio/best/best")
+MPV_HWDEC = _env_get(["PABS_MPV_HWDEC"], "no")
+
+MPV_VO = _env_get(["PABS_MPV_VO"], "").strip()
+MPV_GPU_CONTEXT = _env_get(["PABS_MPV_GPU_CONTEXT"], "").strip()
+MPV_EXTRA_OPTS_RAW = _env_get(["PABS_MPV_EXTRA_OPTS"], "").strip()
 
 MPV_BASE_OPTS = [
     MPV,
@@ -87,86 +122,88 @@ MPV_BASE_OPTS = [
     "--no-osc",
     "--no-osd-bar",
     "--keep-open=no",
-    "--log-file=/tmp/mpv.log",
-    "--ytdl-format=bestvideo[height<=720]+bestaudio/best/best",
-    "--hwdec=no",  # Deshabilitar hardware decode - usar software
-    "--vo=gpu",     # Forzar GPU output
-    "--gpu-context=wayland"  # Usar contexto Wayland explícitamente
+    f"--log-file={MPV_LOG}",
+    f"--ytdl-format={MPV_YTDL_FORMAT}",
+    f"--hwdec={MPV_HWDEC}",
 ]
 
-# Opciones adicionales específicas para reproducción de URLs (YouTube) usando mpv's ytdl support.
-# Defínelo como lista vacía si no se necesitan opciones extra.
+if MPV_VO:
+    MPV_BASE_OPTS.append(f"--vo={MPV_VO}")
+if MPV_GPU_CONTEXT:
+    MPV_BASE_OPTS.append(f"--gpu-context={MPV_GPU_CONTEXT}")
+if MPV_EXTRA_OPTS_RAW:
+    MPV_BASE_OPTS.extend(MPV_EXTRA_OPTS_RAW.split())
+
 YTDL_OPTS = ["--ytdl"]
-# Formatos a intentar para yt-dlp/mpv (de más restrictivo a menos restrictivo)
 YTDL_FORMAT_TRIES = [
     "bestvideo[height<=720]+bestaudio/best/best",
     "bestvideo[height<=1080]+bestaudio/best/best",
     "bestvideo+bestaudio/best",
-    "best"
+    "best",
 ]
 
-
-# ==== ESTADO GLOBAL ====
+# ----------------------------
+# State
+# ----------------------------
 state_lock = threading.Lock()
 MODE_LOOP = "LOOP"
 MODE_DIRECT = "DIRECT"
 
 state = {
-    "mode": MODE_LOOP,         # LOOP o DIRECT
+    "mode": MODE_LOOP,
     "loop_running": False,
-    "loop_playlist": None,     # dict con items...
-    "loop_playlist_file": str(DEFAULT_PLAYLIST_FILE),
+    "loop_playlist": None,
+    "loop_playlist_file": str(PLAYLIST_FILE),
     "loop_black_between": 0,
     "loop_shuffle": False,
     "retries": 0,
     "current_item": None,
-    "current_src": "ninguno",  # archivo actualmente en reproducción
+    "current_src": "ninguno",
     "last_error": None,
-    "show_time": False,        # mostrar hora en cada item
-    "schedule_enabled": False, # si el horario está habilitado
-    "schedule_start": None,    # hora de inicio (HH:MM) o None para 24/7
-    "schedule_end": None,      # hora de fin (HH:MM) o None para 24/7
-    "scheduled_playlists": [],  # lista de playlists programados [{file, start_time}]
-    "active_scheduled_playlist": None,  # playlist programado actualmente activo
+    "show_time": False,
+    "schedule_enabled": False,
+    "schedule_start": None,
+    "schedule_end": None,
+    "scheduled_playlists": [],
+    "active_scheduled_playlist": None,
 }
-stop_all_event = threading.Event()        # para parar playback actual
-loop_should_run = threading.Event()       # habilita/inhabilita el loop
-direct_queue = queue.Queue()              # comandos puntuales a reproducir
-mpv_proc = None                           # proceso actual de mpv
-schedule_change_event = threading.Event() # señal para cambiar a playlist programado
+
+stop_all_event = threading.Event()
+loop_should_run = threading.Event()
+direct_queue = queue.Queue()
+mpv_proc = None
+schedule_change_event = threading.Event()
+
 
 def publish(client, topic, payload):
     try:
         payload_json = json.dumps(payload)
     except Exception as e:
-        logging.error("[MQTT][SEND] Failed to json-encode payload for topic %s: %s", topic, e)
+        log.error("[MQTT][SEND] json error (%s): %s", topic, e)
         return
+
     try:
-        logging.info("[MQTT][SEND] Topic: %s | Payload: %s", topic, payload_json)
-        res = client.publish(topic, payload_json, qos=1, retain=False)
-        try:
-            mid = getattr(res, 'mid', None)
-            logging.debug("[MQTT][SEND] publish result mid=%s", mid)
-        except Exception:
-            pass
-        return res
+        log.info("[MQTT][SEND] %s | %s", topic, payload_json)
+        return client.publish(topic, payload_json, qos=1, retain=False)
     except Exception as e:
-        logging.error("[MQTT][SEND] Error publishing to %s: %s", topic, e)
+        log.error("[MQTT][SEND] publish error (%s): %s", topic, e)
+
 
 def set_state(**kwargs):
     with state_lock:
         state.update(kwargs)
 
+
 def get_state():
     with state_lock:
         return dict(state)
 
+
 def run_cmd(cmd):
     global mpv_proc
     try:
-        logging.info(f"[MPV] Executing command: {' '.join(cmd)}")
+        log.info("[MPV] %s", " ".join(cmd))
         mpv_proc = subprocess.Popen(cmd)
-        # Bucle de espera con capacidad de cancelación
         while True:
             if stop_all_event.is_set():
                 try:
@@ -178,6 +215,7 @@ def run_cmd(cmd):
                 except Exception:
                     pass
                 return False
+
             ret = mpv_proc.poll()
             if ret is not None:
                 return ret == 0
@@ -185,112 +223,74 @@ def run_cmd(cmd):
     finally:
         mpv_proc = None
 
+
 def build_media_path(src, kind):
-    """
-    Construye la ruta completa del archivo de media según su tipo.
-    Si src ya es una ruta absoluta o URL, la retorna sin cambios.
-    Si es un nombre de archivo simple (sin separadores de ruta), 
-    lo construye automáticamente en el directorio correspondiente:
-    - video -> media/videos/
-    - image -> media/images/
-    - youtube -> retorna src sin cambios (es una URL)
-    
-    Esto permite que el frontend solo envíe el nombre del archivo y el tipo,
-    sin necesidad de especificar la ruta completa.
-    """
-    # Si ya es una ruta absoluta o URL, no modificar
-    if src.startswith('/') or src.startswith('http://') or src.startswith('https://'):
+    if not src:
         return src
-    
-    # Si contiene separadores de ruta (relativa), usarla tal cual
-    if '/' in src or '\\' in src:
+
+    if src.startswith("/") or src.startswith("http://") or src.startswith("https://"):
         return src
-    
-    # Si es solo un nombre de archivo, construir ruta según el tipo
+
+    if "/" in src or "\\" in src:
+        return src
+
     if kind == "video":
         return str(MEDIA_VIDEO_DIR / src)
-    elif kind == "image":
+    if kind == "image":
         return str(MEDIA_IMAGE_DIR / src)
-    else:
-        # Para youtube u otros, retornar sin cambios
-        return src
+    return src
+
 
 def play_image(src, duration):
     cmd = MPV_BASE_OPTS + [f"--image-display-duration={int(duration or 8)}", "--loop-file=no", src]
     return run_cmd(cmd)
 
+
 def play_video(src, duration=None, start_at=None):
     cmd = MPV_BASE_OPTS.copy()
     if start_at:
         cmd += [f"--start={start_at}"]
-    # Ignorar duration para videos - reproducir completo
-    # if duration:
-    #     cmd += [f"--end=+{int(duration)}"]
-    cmd += [src]
-    return run_cmd(cmd)
-    cmd = MPV_BASE_OPTS.copy()
-    if start_at:
-        cmd += [f"--start={start_at}"]
-    # Ignorar duration para videos - reproducir completo
-    # if duration:
-    #     cmd += [f"--end=+{int(duration)}"]
     cmd += [src]
     return run_cmd(cmd)
 
+
 def play_youtube(url, duration=None, start_at=None):
-    # Intento directo con mpv usando las opciones YTDL
     cmd = MPV_BASE_OPTS.copy() + YTDL_OPTS
     if start_at:
         cmd += [f"--start={start_at}"]
-    # Ignorar duration para videos - reproducir completo
-    # if duration:
-    #     cmd += [f"--end=+{int(duration)}"]
     cmd += [url]
-    logging.info(f"[YOUTUBE] Ejecutando: {' '.join(cmd)}")
-    result = run_cmd(cmd)
-    if result:
+    ok = run_cmd(cmd)
+    if ok:
         return True
 
-    logging.warning("[YOUTUBE] Reproducción directa falló para %s — intentando fallback con yt-dlp", url)
-    # Intentar obtener URL directo con yt-dlp o youtube-dl
+    log.warning("[YOUTUBE] mpv directo falló, intentando fallback yt-dlp: %s", url)
     ytdlp = shutil.which("yt-dlp") or shutil.which("youtube-dl")
     if not ytdlp:
-        logging.error("[YOUTUBE] No se encontró yt-dlp ni youtube-dl para fallback")
+        log.error("[YOUTUBE] yt-dlp/youtube-dl no encontrado")
         return False
 
-    # 1) intentar obtener URL directo probando varios formatos
     for fmt in YTDL_FORMAT_TRIES:
         try:
-            logging.info("[YOUTUBE] intentando --get-url con formato: %s", fmt)
             out = subprocess.check_output([ytdlp, "-f", fmt, "--get-url", url], text=True, stderr=subprocess.STDOUT, timeout=20)
-            urls = [l for l in out.splitlines() if l.strip()]
+            urls = [l.strip() for l in out.splitlines() if l.strip()]
             for du in urls:
                 cmd2 = MPV_BASE_OPTS.copy()
                 if start_at:
                     cmd2 += [f"--start={start_at}"]
-                # Ignorar duration para videos - reproducir completo
-                # if duration:
-                #     cmd2 += [f"--end=+{int(duration)}"]
                 cmd2 += [du]
-                logging.info("[YOUTUBE] Intentando reproducir URL directo obtenido por yt-dlp: %s", du)
                 if run_cmd(cmd2):
                     return True
         except subprocess.TimeoutExpired:
-            logging.warning("[YOUTUBE] yt-dlp --get-url timed out for format %s", fmt)
             continue
-        except subprocess.CalledProcessError as e:
-            logging.warning("[YOUTUBE] yt-dlp --get-url falló para formato %s: %s", fmt, getattr(e, 'output', str(e)))
+        except subprocess.CalledProcessError:
             continue
-        except Exception as e:
-            logging.warning("[YOUTUBE] Excepción al obtener URL con yt-dlp para formato %s: %s", fmt, e)
+        except Exception:
             continue
 
-    # 2) intentar descargar al cache y reproducir localmente
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         out_pattern = str(CACHE_DIR / "%(id)s.%(ext)s")
         dl_cmd = [ytdlp, "-f", "bv*+ba/b", "-o", out_pattern, url]
-        logging.info("[YOUTUBE] Descargando con yt-dlp para reproducción local: %s", ' '.join(dl_cmd))
         ok = subprocess.call(dl_cmd) == 0
         if ok:
             try:
@@ -301,203 +301,80 @@ def play_youtube(url, duration=None, start_at=None):
                 for ext in ("mp4", "mkv", "webm"):
                     cand = CACHE_DIR / f"{vid}.{ext}"
                     if cand.exists():
-                        logging.info("[YOUTUBE] Reproduciendo archivo descargado: %s", cand)
                         return play_video(str(cand), duration=duration, start_at=start_at)
-            # si no encontramos por id, reproducir el primer archivo descargado en cache
             files = list(CACHE_DIR.glob("*.*"))
             if files:
                 files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                logging.info("[YOUTUBE] Reproduciendo archivo descargado reciente: %s", files[0])
                 return play_video(str(files[0]), duration=duration, start_at=start_at)
-        else:
-            logging.error("[YOUTUBE] Falló la descarga con yt-dlp")
     except Exception as e:
-        logging.error("[YOUTUBE] Excepción en fallback de descarga: %s", e)
+        log.error("[YOUTUBE] fallback descarga error: %s", e)
 
-    logging.error("[YOUTUBE] No se pudo reproducir %s ni con mpv ni con yt-dlp", url)
     return False
 
 
-def tv_power_control(state):
-    """Intentar encender/apagar la TV usando los métodos disponibles en RPi.
-    state: 'on' o 'off'. Devuelve tuple (success: bool, detail: str).
-    Métodos intentados (en este orden):
-    1. tvservice (Raspberry Pi): 'tvservice -p/-o' (PREFERIDO)
-    2. vcgencmd (Raspberry Pi alternativo): 'vcgencmd display_power 0/1'
-    3. framebuffer directo: /sys/class/graphics/fb0/blank
-    4. cec-client (libcec): enviar 'on 0' / 'standby 0' (fallback)
-    """
-    state = (state or "").lower()
-    if state not in ("on", "off"):
-        logging.error("[TV] Estado desconocido para tv_power_control: %s", state)
+def tv_power_control(state_req):
+    state_req = (state_req or "").lower()
+    if state_req not in ("on", "off"):
         return False, "invalid state"
 
-    # Preferir tvservice por defecto. Se puede forzar solo CEC con PABS_TV_CEC_ONLY=1
-    cec_only = os.environ.get("PABS_TV_CEC_ONLY", "0") in ("1","true","True")
-    
-    # Método 1: Intentar tvservice primero (solo RPi) - más confiable
+    cec_only = os.environ.get("PABS_TV_CEC_ONLY", "0") in ("1", "true", "True")
+
     if not cec_only:
         tvs = shutil.which("tvservice")
         if tvs:
             try:
-                if state == "on":
-                    cmd = [tvs, "-p"]
-                    # Después de encender, necesitamos reconfigurar la resolución
-                    fbset_cmd = "fbset -depth 8 && fbset -depth 16"
-                else:
-                    cmd = [tvs, "-o"]
-                
-                logging.info("[TV] Ejecutando tvservice para %s", state)
+                cmd = [tvs, "-p"] if state_req == "on" else [tvs, "-o"]
                 res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-                out = (res.stdout or b"").decode('utf-8', errors='ignore').strip()
-                err = (res.stderr or b"").decode('utf-8', errors='ignore').strip()
-                
+                out = (res.stdout or b"").decode("utf-8", errors="ignore").strip()
+                err = (res.stderr or b"").decode("utf-8", errors="ignore").strip()
                 if res.returncode == 0:
-                    logging.info("[TV] tvservice ejecutado exitosamente: %s", out)
-                    # Si encendimos, refrescar framebuffer
-                    if state == "on":
-                        try:
-                            subprocess.run(fbset_cmd, shell=True, timeout=5, capture_output=True)
-                        except Exception:
-                            pass
                     return True, out or "tvservice success"
-                
-                logging.warning("[TV] tvservice falló: %s", err or out)
+                log.warning("[TV] tvservice falló: %s", err or out)
             except Exception as e:
-                logging.error("[TV] excepción al usar tvservice: %s", e)
-        else:
-            logging.debug("[TV] tvservice no encontrado")
-        
-        # Método 2: Intentar vcgencmd (alternativa RPi)
+                log.error("[TV] tvservice excepción: %s", e)
+
         vcgen = shutil.which("vcgencmd")
         if vcgen:
             try:
-                # vcgencmd display_power 0 = off, 1 = on
-                power_val = "1" if state == "on" else "0"
-                cmd = [vcgen, "display_power", power_val]
-                
-                logging.info("[TV] Ejecutando vcgencmd display_power %s", power_val)
-                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-                out = (res.stdout or b"").decode('utf-8', errors='ignore').strip()
-                err = (res.stderr or b"").decode('utf-8', errors='ignore').strip()
-                
-                # Verificar si el comando está registrado
-                if "not registered" not in out.lower() and "not registered" not in err.lower():
-                    if res.returncode == 0:
-                        logging.info("[TV] vcgencmd ejecutado exitosamente: %s", out)
-                        return True, out or "vcgencmd success"
-                else:
-                    logging.debug("[TV] vcgencmd display_power no está registrado")
-                
-                logging.warning("[TV] vcgencmd falló: %s", err or out)
+                power_val = "1" if state_req == "on" else "0"
+                res = subprocess.run([vcgen, "display_power", power_val], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                out = (res.stdout or b"").decode("utf-8", errors="ignore").strip()
+                err = (res.stderr or b"").decode("utf-8", errors="ignore").strip()
+                if res.returncode == 0 and "not registered" not in (out + err).lower():
+                    return True, out or "vcgencmd success"
             except Exception as e:
-                logging.error("[TV] excepción al usar vcgencmd: %s", e)
-        else:
-            logging.debug("[TV] vcgencmd no encontrado")
-        
-        # Método 2b: Intentar xset (para sistemas con X11)
+                log.error("[TV] vcgencmd excepción: %s", e)
+
         xset = shutil.which("xset")
         if xset and os.environ.get("DISPLAY"):
             try:
-                if state == "on":
-                    # Encender display y desactivar DPMS
-                    cmd = [xset, "dpms", "force", "on"]
-                else:
-                    # Apagar display
-                    cmd = [xset, "dpms", "force", "off"]
-                
-                logging.info("[TV] Ejecutando xset dpms force %s", "on" if state == "on" else "off")
+                cmd = [xset, "dpms", "force", "on"] if state_req == "on" else [xset, "dpms", "force", "off"]
                 res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-                out = (res.stdout or b"").decode('utf-8', errors='ignore').strip()
-                err = (res.stderr or b"").decode('utf-8', errors='ignore').strip()
-                
                 if res.returncode == 0:
-                    logging.info("[TV] xset ejecutado exitosamente")
                     return True, "xset dpms success"
-                
-                logging.warning("[TV] xset falló: %s", err or out)
             except Exception as e:
-                logging.error("[TV] excepción al usar xset: %s", e)
-        else:
-            if not xset:
-                logging.debug("[TV] xset no encontrado")
-            elif not os.environ.get("DISPLAY"):
-                logging.debug("[TV] DISPLAY no está configurado (no hay X11)")
-        
-        # Método 3: Intentar control directo del framebuffer
-        fb_blank = Path("/sys/class/graphics/fb0/blank")
-        if fb_blank.exists():
-            try:
-                # 0 = unblank (on), 1 = blank (off)
-                blank_val = "0" if state == "on" else "1"
-                
-                logging.info("[TV] Escribiendo %s a /sys/class/graphics/fb0/blank", blank_val)
-                # Necesita permisos root, intentar con sudo
-                res = subprocess.run(
-                    ["sudo", "tee", str(fb_blank)],
-                    input=blank_val,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=5
-                )
-                
-                if res.returncode == 0:
-                    logging.info("[TV] framebuffer blank ejecutado exitosamente")
-                    return True, "framebuffer success"
-                
-                logging.warning("[TV] framebuffer blank falló: %s", res.stderr)
-            except Exception as e:
-                logging.error("[TV] excepción al usar framebuffer: %s", e)
-        else:
-            logging.debug("[TV] /sys/class/graphics/fb0/blank no encontrado")
+                log.error("[TV] xset excepción: %s", e)
 
-    # Preferir control por HDMI (cec-client). Se puede forzar solo HDMI con PABS_TV_HDMI_ONLY=1
-    hdmi_only = cec_only  # Alias para compatibilidad
-
-    # Intentar cec-client
     cec = shutil.which("cec-client")
     if cec:
         try:
             cmd = [cec, "-s", "-d", "1"]
-            if state == "on":
-                inp = "on 0\n"
-            else:
-                inp = "standby 0\n"
-            logging.info("[TV] Ejecutando cec-client para %s", state)
+            inp = "on 0\n" if state_req == "on" else "standby 0\n"
             res = subprocess.run(cmd, input=inp, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             out = (res.stdout or "").strip()
             err = (res.stderr or "").strip()
-            
-            # Verificar errores de transmisión CEC en la salida
-            combined_output = (out + "\n" + err).lower()
-            has_cec_errors = any(error_pattern in combined_output for error_pattern in [
-                "ioctl cec_transmit failed",
-                "cec_transmit failed",
-                "errno=",
-                "failed to open",
-                "no device"
-            ])
-            
-            if res.returncode == 0 and not has_cec_errors:
-                logging.info("[TV] cec-client ejecutado exitosamente")
-                return True, out or None
-            
-            # Hay errores incluso si returncode es 0
-            error_msg = err or out or "cec-client failed"
-            logging.warning("[TV] cec-client falló con errores CEC: %s", error_msg[:200])
-            # Devolver el error específico en lugar de continuar
-            return False, error_msg
+            combined = (out + "\n" + err).lower()
+            bad = any(p in combined for p in ["cec_transmit failed", "failed to open", "no device", "errno="])
+            if res.returncode == 0 and not bad:
+                return True, out or "cec success"
+            return False, err or out or "cec failed"
         except Exception as e:
-            logging.error("[TV] excepción al usar cec-client: %s", e)
             return False, str(e)
 
-    logging.warning("[TV] No se pudo controlar la TV: ningún método disponible")
     return False, "no method available"
-    
+
 
 def parse_time_str(time_str):
-    """Convierte string 'HH:MM' a objeto datetime.time. Retorna None si inválido."""
     if not time_str:
         return None
     try:
@@ -509,35 +386,26 @@ def parse_time_str(time_str):
     except Exception:
         return None
 
+
 def is_within_schedule(start_time_str, end_time_str):
-    """
-    Verifica si la hora actual está dentro del rango de horario especificado.
-    - Si start_time_str y end_time_str son None, retorna True (modo 24/7)
-    - Si solo end_time_str es None, reproduce desde start_time hasta fin del día
-    - Maneja correctamente horarios que cruzan medianoche (ej: 22:00 - 02:00)
-    """
     if not start_time_str and not end_time_str:
-        return True  # Modo 24/7
-    
+        return True
+
     start_t = parse_time_str(start_time_str)
     end_t = parse_time_str(end_time_str)
-    
+
     if not start_t:
-        return True  # Si no hay hora de inicio válida, siempre activo
-    
+        return True
+
     now = datetime.now().time()
-    
+
     if not end_t:
-        # Solo hay hora de inicio, reproduce hasta fin del día
         return now >= start_t
-    
-    # Ambas horas están definidas
+
     if start_t <= end_t:
-        # Horario normal (no cruza medianoche)
         return start_t <= now <= end_t
-    else:
-        # Horario que cruza medianoche (ej: 22:00 - 02:00)
-        return now >= start_t or now <= end_t
+    return now >= start_t or now <= end_t
+
 
 def maybe_prefetch(item, publish_fn=None):
     if item.get("kind") != "youtube" or not item.get("prefetch"):
@@ -545,43 +413,61 @@ def maybe_prefetch(item, publish_fn=None):
     ytdlp = shutil.which("yt-dlp")
     if not ytdlp:
         return item
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    # Obtener ID primero
     try:
         vid = subprocess.check_output([ytdlp, "--get-id", item["src"]], text=True).strip()
     except Exception:
         return item
-    out_pattern = str(CACHE_DIR / "%(id)s.%(ext)s")
-    # Descargar si no existe
-    dest = None
-    for ext in ("mp4","mkv","webm"):
+
+    for ext in ("mp4", "mkv", "webm"):
         cand = CACHE_DIR / f"{vid}.{ext}"
         if cand.exists():
-            dest = cand
-            break
-    if dest is None:
-        cmd = [ytdlp, "-f", "bv*+ba/b", "-o", out_pattern, item["src"]]
-        if publish_fn: publish_fn({"event":"prefetch.start","url":item["src"]})
-        ok = subprocess.call(cmd) == 0
-        if not ok:
-            if publish_fn: publish_fn({"event":"prefetch.error","url":item["src"]})
-            return item
-        for ext in ("mp4","mkv","webm"):
-            cand = CACHE_DIR / f"{vid}.{ext}"
-            if cand.exists():
-                dest = cand
-                break
-    if dest:
-        new_item = dict(item)
-        new_item["kind"] = "video"
-        new_item["src"] = str(dest)
-        new_item.pop("prefetch", None)
-        return new_item
+            new_item = dict(item)
+            new_item["kind"] = "video"
+            new_item["src"] = str(cand)
+            new_item.pop("prefetch", None)
+            return new_item
+
+    out_pattern = str(CACHE_DIR / "%(id)s.%(ext)s")
+    cmd = [ytdlp, "-f", "bv*+ba/b", "-o", out_pattern, item["src"]]
+    if publish_fn:
+        publish_fn({"event": "prefetch.start", "url": item["src"]})
+    ok = subprocess.call(cmd) == 0
+    if not ok:
+        if publish_fn:
+            publish_fn({"event": "prefetch.error", "url": item["src"]})
+        return item
+
+    for ext in ("mp4", "mkv", "webm"):
+        cand = CACHE_DIR / f"{vid}.{ext}"
+        if cand.exists():
+            new_item = dict(item)
+            new_item["kind"] = "video"
+            new_item["src"] = str(cand)
+            new_item.pop("prefetch", None)
+            return new_item
+
     return item
 
-def load_playlist_from_file(path):
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+
+def normalize_playlist(data):
+    if not isinstance(data, dict):
+        return {"items": []}
+
+    if "items" not in data and "list" in data:
+        data["items"] = data.pop("list")
+
+    items = data.get("items") or []
+    norm_items = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if "kind" not in it and "type" in it:
+            it["kind"] = it.pop("type")
+        norm_items.append(it)
+
+    data["items"] = norm_items
     data.setdefault("shuffle", False)
     data.setdefault("black_between", 0)
     data.setdefault("retries", 0)
@@ -589,89 +475,85 @@ def load_playlist_from_file(path):
     data.setdefault("schedule_enabled", False)
     data.setdefault("schedule_start", None)
     data.setdefault("schedule_end", None)
-    items = data.get("items", [])
-    data["items"] = [x for x in items]
     return data
 
+
+def load_playlist_from_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return normalize_playlist(raw)
+
+
 def handle_item_play(item, retries, publish_fn=None, show_time=False):
-    # Prefetch si aplica
     it = maybe_prefetch(item, publish_fn=publish_fn)
     kind = it.get("kind")
-    src  = it.get("src")
-    dur  = it.get("duration")
-    start= it.get("start_at")
-    
-    # Construir ruta completa según el tipo de contenido
-    full_path = build_media_path(src, kind)
-    
-    # Log para debugging
-    if src != full_path:
-        logging.debug("[MEDIA] %s '%s' -> '%s'", kind.upper(), src, full_path)
+    src = it.get("src")
+    dur = it.get("duration")
+    start = it.get("start_at")
 
-    for attempt in range(retries+1):
+    full_path = build_media_path(src, kind)
+    set_state(current_src=full_path or "ninguno")
+
+    for _attempt in range(int(retries or 0) + 1):
         if stop_all_event.is_set():
             return "stopped"
-        
-        # Agregar timestamp si show_time está habilitado
-        timestamp = datetime.now().strftime("%H:%M:%S") if show_time else None
-        publish_payload = {"event":"start", "item":it}
-        if timestamp:
-            publish_payload["timestamp"] = timestamp
-        
-        if publish_fn: publish_fn(publish_payload)
-        
+
+        payload_start = {"event": "start", "item": it}
+        if show_time:
+            payload_start["timestamp"] = datetime.now().strftime("%H:%M:%S")
+        if publish_fn:
+            publish_fn(payload_start)
+
+        ok = True
         if kind == "image":
             ok = play_image(full_path, dur or 8)
         elif kind == "video":
             ok = play_video(full_path, duration=dur, start_at=start)
         elif kind == "youtube":
             ok = play_youtube(full_path, duration=dur, start_at=start)
-        else:
-            ok = True  # ignora
-        
-        # Limpiar archivo actual al finalizar
-        set_state(current_src="ninguno")
-        
-        end_payload = {"event":"end", "item":it, "ok": ok}
-        if timestamp:
-            end_payload["timestamp"] = datetime.now().strftime("%H:%M:%S")
-        
-        if publish_fn: 
-            publish_fn(end_payload)
-            # También enviar a TOPIC_STATUS para monitoreo en tiempo real
-            publish_fn({"event":"item.finished", "src": src, "kind": kind, "ok": ok, "timestamp": datetime.now().strftime("%H:%M:%S")})
+
+        payload_end = {"event": "end", "item": it, "ok": bool(ok)}
+        if show_time:
+            payload_end["timestamp"] = datetime.now().strftime("%H:%M:%S")
+        if publish_fn:
+            publish_fn(payload_end)
+
         if ok:
             return "ok"
         time.sleep(0.5)
+
     return "error"
+
 
 def loop_thread_fn(mqttc):
     last_mtime = None
-    tv_state_on = False  # Seguimiento del estado de la TV
-    
+    tv_state_on = False
+
     while True:
-        loop_should_run.wait()  # espera a que pidan loop.start
-        st = get_state()
-        st["loop_running"] = True
+        loop_should_run.wait()
         set_state(loop_running=True, mode=MODE_LOOP)
-        
-        # Limpiar señal de cambio de schedule al inicio
         schedule_change_event.clear()
 
-        # Cargar playlist (file o dict)
+        st = get_state()
         playlist = st.get("loop_playlist")
         path = st.get("loop_playlist_file")
+
         try:
             if playlist is None and path:
                 playlist = load_playlist_from_file(path)
-                last_mtime = Path(path).stat().st_mtime
+                try:
+                    last_mtime = Path(path).stat().st_mtime
+                except Exception:
+                    last_mtime = None
+            else:
+                playlist = normalize_playlist(playlist or {})
         except Exception as e:
             set_state(last_error=str(e))
-            publish(mqttc, TOPIC_STATUS, {"mode":state["mode"], "error": str(e)})
+            publish(mqttc, TOPIC_STATUS, {"event": "error", "error": str(e)})
             time.sleep(2)
             continue
 
-        if not playlist or not playlist.get("items"):
+        if not playlist.get("items"):
             time.sleep(1)
             continue
 
@@ -681,164 +563,110 @@ def loop_thread_fn(mqttc):
         schedule_enabled = bool(playlist.get("schedule_enabled", st.get("schedule_enabled", False)))
         schedule_start = playlist.get("schedule_start", st.get("schedule_start"))
         schedule_end = playlist.get("schedule_end", st.get("schedule_end"))
-        
-        items = playlist["items"][:]
 
+        items = list(playlist["items"])
         if playlist.get("shuffle", st.get("loop_shuffle", False)):
             random.shuffle(items)
 
-        # Verificar horario si está habilitado
         if schedule_enabled:
-            within_schedule = is_within_schedule(schedule_start, schedule_end)
-            
-            if within_schedule and not tv_state_on:
-                # Encender TV al entrar en horario
-                logging.info("[SCHEDULE] Entrando en horario programado, encendiendo TV...")
+            within = is_within_schedule(schedule_start, schedule_end)
+            if within and not tv_state_on:
                 ok, detail = tv_power_control("on")
-                if ok:
-                    tv_state_on = True
-                    publish(mqttc, TOPIC_STATUS, {"event":"schedule.tv_on", "time": datetime.now().strftime("%H:%M:%S")})
-                else:
-                    publish(mqttc, TOPIC_STATUS, {"event":"schedule.tv_on.error", "detail": detail})
-            
-            elif not within_schedule and tv_state_on:
-                # Apagar TV al salir del horario
-                logging.info("[SCHEDULE] Fuera de horario programado, apagando TV...")
+                tv_state_on = bool(ok)
+                publish(mqttc, TOPIC_STATUS, {"event": "schedule.tv_on", "ok": bool(ok), "detail": detail})
+            elif not within and tv_state_on:
                 ok, detail = tv_power_control("off")
-                if ok:
-                    tv_state_on = False
-                    publish(mqttc, TOPIC_STATUS, {"event":"schedule.tv_off", "time": datetime.now().strftime("%H:%M:%S")})
-                else:
-                    publish(mqttc, TOPIC_STATUS, {"event":"schedule.tv_off.error", "detail": detail})
-                
-                # Esperar hasta que llegue el horario nuevamente
-                logging.info("[SCHEDULE] Esperando hasta el próximo horario programado...")
-                while not is_within_schedule(schedule_start, schedule_end) and loop_should_run.is_set():
-                    time.sleep(30)  # Verificar cada 30 segundos
-                continue
-            
-            elif not within_schedule:
-                # Aún no es hora de reproducir, esperar
-                logging.info("[SCHEDULE] Esperando horario programado (inicio: %s)", schedule_start)
+                tv_state_on = False if ok else tv_state_on
+                publish(mqttc, TOPIC_STATUS, {"event": "schedule.tv_off", "ok": bool(ok), "detail": detail})
+
+            if not within:
                 while not is_within_schedule(schedule_start, schedule_end) and loop_should_run.is_set():
                     time.sleep(30)
                 continue
 
-        # Reproducción del ciclo
         for it in items:
             if not loop_should_run.is_set():
                 break
-            
-            # Verificar si hay un cambio de playlist programado
             if schedule_change_event.is_set():
-                logging.info("[SCHEDULE] Cambio de playlist programado detectado, interrumpiendo loop actual")
                 break
-            
-            # Verificar horario antes de cada item si está habilitado
             if schedule_enabled and not is_within_schedule(schedule_start, schedule_end):
-                logging.info("[SCHEDULE] Saliendo de horario programado durante reproducción")
                 break
-            
+
             stop_all_event.clear()
             set_state(current_item=it)
-            res = handle_item_play(it, retries, publish_fn=lambda p: publish(mqttc, TOPIC_NOWPLAY, p), show_time=show_time)
+
+            res = handle_item_play(
+                it,
+                retries,
+                publish_fn=lambda p: publish(mqttc, TOPIC_NOWPLAY, p),
+                show_time=show_time,
+            )
+
             set_state(current_item=None)
             if res == "stopped":
-                # probablemente cambiaron a DIRECT
                 break
             if black_between > 0 and loop_should_run.is_set():
                 time.sleep(black_between)
 
-        # Autorecarga si el archivo cambió
         try:
             if path:
                 mtime = Path(path).stat().st_mtime
                 if last_mtime and mtime != last_mtime:
-                    publish(mqttc, TOPIC_STATUS, {"event":"playlist.reload"})
+                    publish(mqttc, TOPIC_STATUS, {"event": "playlist.reload"})
                     last_mtime = mtime
         except Exception:
             pass
 
+
 def scheduler_thread_fn(mqttc):
-    """Thread que monitorea los horarios de playlists programados y los activa cuando corresponde"""
     last_check_minute = None
-    
     while True:
-        time.sleep(10)  # Verificar cada 10 segundos
-        
+        time.sleep(10)
         now = datetime.now()
-        current_time = now.time()
         current_minute = (now.hour, now.minute)
-        
-        # Solo verificar una vez por minuto para evitar activaciones duplicadas
         if current_minute == last_check_minute:
             continue
         last_check_minute = current_minute
-        
+
         st = get_state()
         scheduled_playlists = st.get("scheduled_playlists", [])
-        
         if not scheduled_playlists:
             continue
-        
-        # Buscar playlists que deban activarse ahora
-        for sched_pl in scheduled_playlists:
-            start_time_str = sched_pl.get("start_time")
-            playlist_data = sched_pl.get("playlist")
-            playlist_name = sched_pl.get("name", "unnamed")
-            
+
+        for sched in scheduled_playlists:
+            start_time_str = sched.get("start_time")
+            playlist_data = sched.get("playlist")
+            playlist_name = sched.get("name", "unnamed")
             if not start_time_str or not playlist_data:
                 continue
-            
-            start_time = parse_time_str(start_time_str)
-            if not start_time:
+            start_t = parse_time_str(start_time_str)
+            if not start_t:
                 continue
-            
-            # Verificar si es la hora de activar este playlist (con margen de 1 minuto)
-            if start_time.hour == current_time.hour and start_time.minute == current_time.minute:
-                logging.info("[SCHEDULER] ⏰ Activando playlist programado: %s (hora: %s)", playlist_name, start_time_str)
-                
-                # Detener reproducción actual
+            if start_t.hour == now.time().hour and start_t.minute == now.time().minute:
                 stop_all_event.set()
                 loop_should_run.clear()
-                time.sleep(0.5)  # Dar tiempo a que se detenga
-                
-                # Limpiar eventos previos
+                time.sleep(0.5)
                 stop_all_event.clear()
                 schedule_change_event.clear()
-                
-                # Activar el nuevo playlist
-                try:
-                    set_state(
-                        loop_playlist=playlist_data,
-                        loop_playlist_file=None,
-                        active_scheduled_playlist=playlist_name
-                    )
-                    
-                    # Señalizar cambio y reiniciar loop
-                    loop_should_run.set()
-                    
-                    publish(mqttc, TOPIC_STATUS, {
+
+                playlist_data = normalize_playlist(playlist_data)
+                set_state(loop_playlist=playlist_data, loop_playlist_file=None, active_scheduled_playlist=playlist_name)
+                loop_should_run.set()
+                publish(
+                    mqttc,
+                    TOPIC_STATUS,
+                    {
                         "event": "scheduler.playlist_activated",
                         "playlist_name": playlist_name,
                         "start_time": start_time_str,
                         "activated_at": now.strftime("%H:%M:%S"),
-                        "items_count": len(playlist_data.get("items", []))
-                    })
-                    
-                    logging.info("[SCHEDULER] ✅ Playlist programado activado exitosamente (%d items)", len(playlist_data.get("items", [])))
-                    
-                except Exception as e:
-                    logging.error("[SCHEDULER] ❌ Error activando playlist programado: %s", e)
-                    publish(mqttc, TOPIC_STATUS, {
-                        "event": "scheduler.error",
-                        "playlist_name": playlist_name,
-                        "error": str(e)
-                    })
+                        "items_count": len(playlist_data.get("items", [])),
+                    },
+                )
+
 
 def direct_thread_fn(mqttc):
     while True:
-        # Espera un item para reproducir en DIRECT
         payload = direct_queue.get()
         if payload is None:
             continue
@@ -846,515 +674,300 @@ def direct_thread_fn(mqttc):
         return_to_loop = bool(payload.get("return_to_loop", False))
         retries = int(payload.get("retries", 0))
         show_time = bool(payload.get("show_time", get_state().get("show_time", False)))
+
         stop_all_event.clear()
         set_state(mode=MODE_DIRECT, current_item=item)
         handle_item_play(item, retries, publish_fn=lambda p: publish(mqttc, TOPIC_NOWPLAY, p), show_time=show_time)
         set_state(current_item=None)
+
         if return_to_loop:
             set_state(mode=MODE_LOOP)
             loop_should_run.set()
+
         direct_queue.task_done()
 
+
 def heartbeat_thread_fn(mqttc):
-    """Thread que envía heartbeat cada 5 minutos para monitoreo de status"""
     while True:
-        time.sleep(300)  # Enviar heartbeat cada 300 segundos (5 minutos)
-        try:
-            st = get_state()
-            publish(mqttc, TOPIC_STATUS, {
+        time.sleep(300)
+        st = get_state()
+        publish(
+            mqttc,
+            TOPIC_STATUS,
+            {
                 "event": "heartbeat",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "mode": st.get("mode", "LOOP"),
+                "mode": st.get("mode", MODE_LOOP),
                 "client_id": CLIENT_ID,
-                "src": st.get("current_src", "ninguno")
-            })
-        except Exception as e:
-            logging.error("[HEARTBEAT] Error enviando heartbeat: %s", e)
+                "src": st.get("current_src", "ninguno"),
+            },
+        )
 
-def mqtt_thread():
-    import paho.mqtt.client as mqtt
-    logging.info("Iniciando conexión MQTT...")
-    def on_connect(client, userdata, flags, rc, properties=None):
-        logging.info("[MQTT] Connected with result code %s", rc)
-        client.subscribe(TOPIC_CMD, qos=1)
-        st = get_state()
-        publish(client, TOPIC_STATUS, {
-            "event":"online", 
-            "mode": st["mode"],
-            "src": st.get("current_src", "ninguno")
-        })
-        logging.info("[MQTT] Subscribed to topic: pantallas/%s/#", CLIENT_ID)
 
-    def on_message(client, userdata, msg):
+def _install_lockfile():
+    lockfile = Path(tempfile.gettempdir()) / f"pabs-tv-{CLIENT_ID}.lock"
+    if lockfile.exists():
         try:
-            logging.info("[MQTT][RECV] Topic: %s | Payload: %s", msg.topic, msg.payload.decode())
-            data = json.loads(msg.payload.decode("utf-8", errors="ignore") or "{}")
-        except Exception as e:
-            publish(client, TOPIC_STATUS, {"error": f"bad_json: {e}"})
-            logging.info("[MQTT][RECV] Topic: %s | Payload: %s", msg.topic, msg.payload.decode())
-            return
+            old_pid = int(lockfile.read_text().strip())
+            os.kill(old_pid, 0)
+            log.error("Ya hay una instancia ejecutándose (PID: %s). Lockfile: %s", old_pid, lockfile)
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            try:
+                lockfile.unlink()
+            except Exception:
+                pass
 
-        action = data.get("action")
-        if not action:
-            # Compatibilidad: aceptar mensajes simples {'state':'on'} o {'power':'on'}
-            st = data.get("state") or data.get("power")
-            if isinstance(st, str) and st.lower() in ("on", "off"):
-                logging.info("[MQTT] Mensaje sin 'action' pero con 'state' => tratando como tv.power: %s", st)
-                action = "tv.power"
-            else:
-                return
+    try:
+        lockfile.write_text(str(os.getpid()))
+    except Exception:
+        return None
 
-        if action == "loop.start":
-            # detén lo actual y arranca loop
-            stop_all_event.set()
-            set_state(mode=MODE_LOOP)
-            # playlist inline o por archivo
-            playlist = data.get("playlist")
-            playlist_file = data.get("playlist_file") or get_state().get("loop_playlist_file")
-            if playlist:
-                set_state(loop_playlist=playlist, loop_playlist_file=playlist_file)
-            else:
-                set_state(loop_playlist=None, loop_playlist_file=playlist_file)
-            loop_should_run.set()
-            st = get_state()
-            publish(client, TOPIC_STATUS, {
-                "event":"loop.starting",
-                "src": st.get("current_src", "ninguno")
-            })
+    import atexit
 
-        elif action == "loop.stop":
-            loop_should_run.clear()
-            stop_all_event.set()
-            set_state(loop_running=False, current_src="ninguno")
-            publish(client, TOPIC_STATUS, {
-                "event":"loop.stopped",
-                "src": "ninguno"
-            })
+    def _cleanup():
+        try:
+            if lockfile.exists():
+                lockfile.unlink()
+        except Exception:
+            pass
 
-        elif action == "loop.reload":
-            # forzamos recarga volviendo a None para que el hilo lea de archivo
-            st = get_state()
-            if st.get("loop_playlist_file"):
-                set_state(loop_playlist=None)
-                publish(client, TOPIC_STATUS, {"event":"loop.reload.requested"})
+    atexit.register(_cleanup)
+    return lockfile
 
-        elif action == "loop.set_black_between":
-            secs = int(data.get("seconds", 0))
-            set_state(loop_black_between=secs)
-            publish(client, TOPIC_STATUS, {"event":"loop.black_between.set", "seconds": secs})
-
-        elif action == "loop.shuffle":
-            enabled = bool(data.get("enabled", False))
-            set_state(loop_shuffle=enabled)
-            publish(client, TOPIC_STATUS, {"event":"loop.shuffle.set", "enabled": enabled})
-
-        elif action == "play.once":
-            # interrumpe lo actual y ejecuta DIRECT
-            item = data.get("item")
-            if not item:
-                publish(client, TOPIC_STATUS, {"error":"missing item"})
-                return
-            stop_all_event.set()
-            loop_should_run.clear()
-            set_state(mode=MODE_DIRECT)
-            direct_queue.put({
-                "item": item,
-                "return_to_loop": bool(data.get("return_to_loop", False)),
-                "retries": int(data.get("retries", 0)),
-            })
-            publish(client, TOPIC_STATUS, {"event":"direct.enqueued"})
-
-        elif action == "play.stop":
-            stop_all_event.set()
-            set_state(current_item=None, current_src="ninguno")
-            publish(client, TOPIC_STATUS, {
-                "event":"play.stopped",
-                "src": "ninguno"
-            })
-
-        else:
-            publish(client, TOPIC_STATUS, {"error": f"unknown action: {action}"})
-
-    client = mqtt.Client(client_id=f"pabs-tv-{CLIENT_ID}", clean_session=True, protocol=mqtt.MQTTv311)
-    if MQTT_USER and MQTT_PASS:
-        client.username_pw_set(MQTT_USER, MQTT_PASS)
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.will_set(TOPIC_STATUS, json.dumps({"event":"offline"}), qos=1, retain=False)
-
-    client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
-    client.loop_forever()
 
 def main():
     if not MPV or not Path(MPV).exists():
-        logging.info("mpv no encontrado. Instala con: sudo apt-get update && sudo apt-get install -y mpv")
+        log.error("mpv no encontrado. Instala: sudo apt install -y mpv")
         sys.exit(1)
 
-    # Hilos
-    t_loop = threading.Thread(target=lambda: loop_thread_fn(mqttc), daemon=True)
-    t_direct = threading.Thread(target=lambda: direct_thread_fn(mqttc), daemon=True)
+    _install_lockfile()
 
-    # Lanzar MQTT en hilo propio, pero necesitamos el cliente…
-    # Solución: arrancar el hilo MQTT que crea su propio client. Para compartir publish,
-    # inyectamos una referencia global simple.
-    class Wrap: pass
-    w = Wrap()
-    def runner():
-        # crea el cliente dentro y expone referencia global
-        import paho.mqtt.client as mqtt
-        client = mqtt.Client(client_id=f"pabs-tv-{CLIENT_ID}-ctrl", clean_session=True)
-        w.client = client
-        # copiamos la lógica de mqtt_thread pero usando el cliente compartido…
-    # Para no duplicar, simplemente arrancamos mqtt_thread clásico y creamos el client aquí:
-    pass
-
-if __name__ == "__main__":
-    # Simplificamos: primero creamos el cliente MQTT, luego lanzamos hilos con esa referencia
-    
-    # Verificar que no haya otra instancia ejecutándose
-    LOCKFILE = Path(tempfile.gettempdir()) / f"pabs-tv-{CLIENT_ID}.lock"
-    try:
-        if LOCKFILE.exists():
-            # Verificar si el proceso todavía existe
-            try:
-                with open(LOCKFILE, 'r') as f:
-                    old_pid = int(f.read().strip())
-                # Intentar enviar señal 0 para verificar si el proceso existe
-                os.kill(old_pid, 0)
-                logging.error("❌ Ya hay una instancia ejecutándose (PID: %s). Abortando.", old_pid)
-                logging.error("   Lockfile: %s", LOCKFILE)
-                logging.error("   Para forzar inicio: rm %s", LOCKFILE)
-                sys.exit(1)
-            except (ProcessLookupError, ValueError):
-                # El proceso no existe, eliminar lockfile viejo
-                logging.warning("Lockfile antiguo encontrado, eliminando...")
-                LOCKFILE.unlink()
-        
-        # Crear lockfile con nuestro PID
-        with open(LOCKFILE, 'w') as f:
-            f.write(str(os.getpid()))
-        logging.info("✓ Lockfile creado: %s (PID: %s)", LOCKFILE, os.getpid())
-        
-        # Limpiar lockfile al salir
-        import atexit
-        atexit.register(lambda: LOCKFILE.unlink() if LOCKFILE.exists() else None)
-    except Exception as e:
-        logging.warning("No se pudo crear lockfile: %s", e)
-    
     try:
         import paho.mqtt.client as mqtt
     except ImportError:
-        logging.info("Falta paho-mqtt. Instala: python3 -m pip install --break-system-packages paho-mqtt")
+        log.error("Falta paho-mqtt. Instala en el venv: pip install -r requirements.txt")
         sys.exit(1)
 
     mqttc = mqtt.Client(client_id=f"pabs-tv-{CLIENT_ID}", clean_session=True)
     if MQTT_USER and MQTT_PASS:
         mqttc.username_pw_set(MQTT_USER, MQTT_PASS)
 
-    # Variable para rastrear conexiones
-    connection_count = {"count": 0}
-    
+    conn_count = {"count": 0}
+
     def on_connect(client, userdata, flags, rc, properties=None):
-        connection_count["count"] += 1
-        logging.info("[MQTT] Connected with result code %s (conexión #%d)", rc, connection_count["count"])
-        
-        if connection_count["count"] > 1:
-            logging.warning("[MQTT] ⚠️ Reconexión detectada! Esto puede indicar un problema.")
-        
-        try:
-            client.subscribe(TOPIC_CMD, qos=1)
-            logging.info("[MQTT] Subscribed to topic: %s", TOPIC_CMD)
-        except Exception as e:
-            logging.error("[MQTT] Error subscribing to %s: %s", TOPIC_CMD, e)
-        
-        # Solo enviar mensajes de inicio en la primera conexión
-        if connection_count["count"] == 1:
-            st = get_state()
-            publish(client, TOPIC_STATUS, {
-                "event":"online", 
-                "mode": st["mode"], 
-                "client_id": CLIENT_ID,
-                "src": st.get("current_src", "ninguno")
-            })
-            publish(client, TOPIC_STATUS, {
-                "event":"ready", 
-                "mode": st["mode"], 
-                "client_id": CLIENT_ID,
-                "src": st.get("current_src", "ninguno")
-            })
-        else:
-            st = get_state()
-            publish(client, TOPIC_STATUS, {
-                "event":"reconnected", 
-                "mode": st["mode"], 
-                "client_id": CLIENT_ID,
-                "src": st.get("current_src", "ninguno")
-            })
-    
+        conn_count["count"] += 1
+        log.info("[MQTT] connected rc=%s (conn #%d)", rc, conn_count["count"])
+        client.subscribe(TOPIC_CMD, qos=1)
+
+        st = get_state()
+        ev = "online" if conn_count["count"] == 1 else "reconnected"
+        publish(
+            client,
+            TOPIC_STATUS,
+            {"event": ev, "mode": st.get("mode", MODE_LOOP), "client_id": CLIENT_ID, "src": st.get("current_src", "ninguno")},
+        )
+
     def on_disconnect(client, userdata, rc):
         if rc != 0:
-            logging.warning("[MQTT] Desconexión inesperada. Código: %s", rc)
-        else:
-            logging.info("[MQTT] Desconexión limpia")
-    
-    def on_log(client, userdata, level, buf):
-        # Solo loguear mensajes importantes
-        if "PINGRESP" not in buf:
-            logging.debug("[MQTT-LIB] %s", buf)
+            log.warning("[MQTT] desconexión inesperada rc=%s", rc)
 
     def on_message(client, userdata, msg):
-        # Reusamos el handler del mqtt_thread de arriba para no duplicar lógica
         try:
-            # Loguear recepción cruda para facilitar debugging
-            try:
-                payload_text = msg.payload.decode("utf-8", errors="ignore")
-            except Exception:
-                payload_text = str(msg.payload)
-            logging.info("[MQTT][RECV] Topic: %s | Payload: %s", msg.topic, payload_text)
+            payload_text = msg.payload.decode("utf-8", errors="ignore")
             data = json.loads(payload_text or "{}")
         except Exception as e:
-            publish(client, TOPIC_STATUS, {"error": f"bad_json: {e}"})
-            logging.error("[MQTT] bad_json on topic %s: %s", msg.topic, e)
+            publish(client, TOPIC_STATUS, {"event": "error", "error": f"bad_json: {e}"})
             return
-        # Log action and parsed data for debugging
-        logging.info("[MQTT] Parsed action: %s | data: %s", data.get("action"), data)
+
         action = data.get("action")
         if not action:
-            return
+            stv = data.get("state") or data.get("power")
+            if isinstance(stv, str) and stv.lower() in ("on", "off"):
+                action = "tv.power"
+                data["state"] = stv.lower()
+            else:
+                return
+
         if action == "loop.start":
             stop_all_event.set()
             set_state(mode=MODE_LOOP)
             playlist = data.get("playlist")
-            
-            # Transformar "list" a "items" si es necesario (compatibilidad frontend)
-            if playlist and "list" in playlist and "items" not in playlist:
-                playlist["items"] = playlist.pop("list")
-            
-            # Transformar "type" a "kind" en cada item de la playlist
-            if playlist and "items" in playlist:
-                for item in playlist["items"]:
-                    if "type" in item and "kind" not in item:
-                        item["kind"] = item.pop("type")
-            
-            playlist_file = data.get("playlist_file") or get_state().get("loop_playlist_file") or str(DEFAULT_PLAYLIST_FILE)
-            logging.info("[MQTT] loop.start -> playlist inline: %s, playlist_file: %s", bool(playlist), playlist_file)
+
+            if playlist:
+                playlist = normalize_playlist(playlist)
+
+            playlist_file = data.get("playlist_file") or get_state().get("loop_playlist_file") or str(PLAYLIST_FILE)
+
             if playlist:
                 set_state(loop_playlist=playlist, loop_playlist_file=playlist_file)
             else:
                 set_state(loop_playlist=None, loop_playlist_file=playlist_file)
+
+            stop_all_event.clear()
             loop_should_run.set()
-            st = get_state()
-            publish(client, TOPIC_STATUS, {
-                "event":"loop.starting",
-                "src": st.get("current_src", "ninguno")
-            })
+            publish(client, TOPIC_STATUS, {"event": "loop.starting", "src": get_state().get("current_src", "ninguno")})
+
         elif action == "loop.stop":
-            logging.info("[MQTT] loop.stop -> stopping loop and playback")
             loop_should_run.clear()
             stop_all_event.set()
             set_state(loop_running=False, current_src="ninguno")
-            publish(client, TOPIC_STATUS, {
-                "event":"loop.stopped",
-                "src": "ninguno"
-            })
+            publish(client, TOPIC_STATUS, {"event": "loop.stopped", "src": "ninguno"})
+
         elif action == "loop.reload":
             st = get_state()
             if st.get("loop_playlist_file"):
                 set_state(loop_playlist=None)
-                publish(client, TOPIC_STATUS, {"event":"loop.reload.requested"})
+                publish(client, TOPIC_STATUS, {"event": "loop.reload.requested"})
+
         elif action == "loop.set_black_between":
             secs = int(data.get("seconds", 0))
             set_state(loop_black_between=secs)
-            publish(client, TOPIC_STATUS, {"event":"loop.black_between.set", "seconds": secs})
+            publish(client, TOPIC_STATUS, {"event": "loop.black_between.set", "seconds": secs})
+
         elif action == "loop.shuffle":
             enabled = bool(data.get("enabled", False))
             set_state(loop_shuffle=enabled)
-            publish(client, TOPIC_STATUS, {"event":"loop.shuffle.set", "enabled": enabled})
+            publish(client, TOPIC_STATUS, {"event": "loop.shuffle.set", "enabled": enabled})
+
         elif action == "loop.show_time":
             enabled = bool(data.get("enabled", False))
             set_state(show_time=enabled)
-            publish(client, TOPIC_STATUS, {"event":"loop.show_time.set", "enabled": enabled})
+            publish(client, TOPIC_STATUS, {"event": "loop.show_time.set", "enabled": enabled})
+
         elif action == "loop.schedule":
-            # Configurar horarios de reproducción
             enabled = bool(data.get("enabled", False))
-            start_time = data.get("start_time")  # formato "HH:MM"
-            end_time = data.get("end_time")      # formato "HH:MM" o None para sin límite
-            set_state(
-                schedule_enabled=enabled,
-                schedule_start=start_time,
-                schedule_end=end_time
+            start_time = data.get("start_time")
+            end_time = data.get("end_time")
+            set_state(schedule_enabled=enabled, schedule_start=start_time, schedule_end=end_time)
+            publish(
+                client,
+                TOPIC_STATUS,
+                {"event": "loop.schedule.set", "enabled": enabled, "start_time": start_time, "end_time": end_time},
             )
-            publish(client, TOPIC_STATUS, {
-                "event":"loop.schedule.set",
-                "enabled": enabled,
-                "start_time": start_time,
-                "end_time": end_time
-            })
+
         elif action == "scheduler.add":
-            # Agregar playlist programado vía MQTT
-            # {"action":"scheduler.add", "name":"nocturno", "start_time":"21:10", "playlist":{...}}
             playlist_name = data.get("name")
             start_time = data.get("start_time")
             playlist_data = data.get("playlist")
-            
+
             if not playlist_name or not start_time or not playlist_data:
-                publish(client, TOPIC_STATUS, {"event":"scheduler.add.error", "error":"missing name, start_time or playlist"})
+                publish(client, TOPIC_STATUS, {"event": "scheduler.add.error", "error": "missing name/start_time/playlist"})
                 return
-            
-            # Validar formato de hora
+
             if not parse_time_str(start_time):
-                publish(client, TOPIC_STATUS, {"event":"scheduler.add.error", "error":"invalid start_time format (use HH:MM)"})
+                publish(client, TOPIC_STATUS, {"event": "scheduler.add.error", "error": "invalid start_time (HH:MM)"})
                 return
-            
-            # Validar que el playlist tenga items
-            if not isinstance(playlist_data, dict) or not playlist_data.get("items"):
-                publish(client, TOPIC_STATUS, {"event":"scheduler.add.error", "error":"playlist must have items array"})
+
+            playlist_data = normalize_playlist(playlist_data)
+            if not playlist_data.get("items"):
+                publish(client, TOPIC_STATUS, {"event": "scheduler.add.error", "error": "playlist must include items"})
                 return
-            
-            # Agregar a la lista de playlists programados
+
             st = get_state()
             scheduled = st.get("scheduled_playlists", [])
-            
-            # Evitar duplicados (mismo nombre y hora)
-            existing = [s for s in scheduled if s.get("name") == playlist_name and s.get("start_time") == start_time]
-            if existing:
-                publish(client, TOPIC_STATUS, {"event":"scheduler.add.warning", "message":"playlist already scheduled at this time"})
+            if any(s.get("name") == playlist_name and s.get("start_time") == start_time for s in scheduled):
+                publish(client, TOPIC_STATUS, {"event": "scheduler.add.warning", "message": "already exists"})
                 return
-            
-            scheduled.append({
-                "name": playlist_name,
-                "start_time": start_time,
-                "playlist": playlist_data
-            })
+
+            scheduled.append({"name": playlist_name, "start_time": start_time, "playlist": playlist_data})
             set_state(scheduled_playlists=scheduled)
-            
-            publish(client, TOPIC_STATUS, {
-                "event":"scheduler.add.success",
-                "name": playlist_name,
-                "start_time": start_time,
-                "items_count": len(playlist_data.get("items", [])),
-                "total_scheduled": len(scheduled)
-            })
-            logging.info("[SCHEDULER] ✅ Playlist programado agregado: %s a las %s (%d items)", 
-                        playlist_name, start_time, len(playlist_data.get("items", [])))
-        
+            publish(
+                client,
+                TOPIC_STATUS,
+                {"event": "scheduler.add.success", "name": playlist_name, "start_time": start_time, "total": len(scheduled)},
+            )
+
         elif action == "scheduler.remove":
-            # Remover playlist programado: {"action":"scheduler.remove", "name":"nocturno"}
             playlist_name = data.get("name")
-            
             if not playlist_name:
-                publish(client, TOPIC_STATUS, {"event":"scheduler.remove.error", "error":"missing name"})
+                publish(client, TOPIC_STATUS, {"event": "scheduler.remove.error", "error": "missing name"})
                 return
-            
             st = get_state()
             scheduled = st.get("scheduled_playlists", [])
             new_scheduled = [s for s in scheduled if s.get("name") != playlist_name]
-            
-            if len(new_scheduled) == len(scheduled):
-                publish(client, TOPIC_STATUS, {"event":"scheduler.remove.warning", "message":"playlist not found"})
-                return
-            
             set_state(scheduled_playlists=new_scheduled)
-            publish(client, TOPIC_STATUS, {
-                "event":"scheduler.remove.success",
-                "name": playlist_name,
-                "total_scheduled": len(new_scheduled)
-            })
-            logging.info("[SCHEDULER] ✅ Playlist programado removido: %s", playlist_name)
-        
+            publish(client, TOPIC_STATUS, {"event": "scheduler.remove.success", "name": playlist_name, "total": len(new_scheduled)})
+
         elif action == "scheduler.list":
-            # Listar playlists programados
             st = get_state()
-            scheduled = st.get("scheduled_playlists", [])
-            publish(client, TOPIC_STATUS, {
-                "event":"scheduler.list",
-                "scheduled_playlists": scheduled,
-                "total": len(scheduled),
-                "active": st.get("active_scheduled_playlist")
-            })
-        
+            publish(
+                client,
+                TOPIC_STATUS,
+                {
+                    "event": "scheduler.list",
+                    "scheduled_playlists": st.get("scheduled_playlists", []),
+                    "total": len(st.get("scheduled_playlists", [])),
+                    "active": st.get("active_scheduled_playlist"),
+                },
+            )
+
         elif action == "tv.power":
-            # Control de encendido/apagado de la TV
             state_tv = (data.get("state") or "").lower()
-            if state_tv not in ("on", "off"):
-                publish(client, TOPIC_STATUS, {"event":"tv.power","error":"invalid_state","state": state_tv})
-            else:
-                ok, detail = tv_power_control(state_tv)
-                publish(client, TOPIC_STATUS, {"event":"tv.power","state": state_tv, "ok": bool(ok), "detail": detail})
+            ok, detail = tv_power_control(state_tv)
+            publish(client, TOPIC_STATUS, {"event": "tv.power", "state": state_tv, "ok": bool(ok), "detail": detail})
+
         elif action == "play.once":
             item = data.get("item")
-            if not item:
-                publish(client, TOPIC_STATUS, {"error":"missing item"})
+            if not item or not isinstance(item, dict):
+                publish(client, TOPIC_STATUS, {"event": "error", "error": "missing item"})
                 return
-            
-            # Transformar "type" a "kind" si es necesario (compatibilidad frontend)
-            if "type" in item and "kind" not in item:
+            if "kind" not in item and "type" in item:
                 item["kind"] = item.pop("type")
-            
-            logging.info("[MQTT] play.once -> item: %s, return_to_loop: %s, retries: %s", item, data.get("return_to_loop"), data.get("retries"))
+
             stop_all_event.set()
             loop_should_run.clear()
             set_state(mode=MODE_DIRECT)
-            direct_queue.put({
-                "item": item,
-                "return_to_loop": bool(data.get("return_to_loop", False)),
-                "retries": int(data.get("retries", 0)),
-                "show_time": bool(data.get("show_time", get_state().get("show_time", False))),
-            })
-            publish(client, TOPIC_STATUS, {"event":"direct.enqueued"})
+
+            direct_queue.put(
+                {
+                    "item": item,
+                    "return_to_loop": bool(data.get("return_to_loop", False)),
+                    "retries": int(data.get("retries", 0)),
+                    "show_time": bool(data.get("show_time", get_state().get("show_time", False))),
+                }
+            )
+            publish(client, TOPIC_STATUS, {"event": "direct.enqueued"})
+
         elif action == "play.stop":
-            logging.info("[MQTT] play.stop -> stopping current playback")
             stop_all_event.set()
             set_state(current_item=None, current_src="ninguno")
-            publish(client, TOPIC_STATUS, {
-                "event":"play.stopped",
-                "src": "ninguno"
-            })
+            publish(client, TOPIC_STATUS, {"event": "play.stopped", "src": "ninguno"})
+
         else:
-            publish(client, TOPIC_STATUS, {"error": f"unknown action: {action}"})
+            publish(client, TOPIC_STATUS, {"event": "error", "error": f"unknown action: {action}"})
 
     mqttc.on_connect = on_connect
     mqttc.on_disconnect = on_disconnect
     mqttc.on_message = on_message
-    mqttc.on_log = on_log
-    mqttc.will_set(TOPIC_STATUS, json.dumps({"event":"offline"}), qos=1, retain=False)
-    
-    # Configurar reconexión automática
+    mqttc.will_set(TOPIC_STATUS, json.dumps({"event": "offline"}), qos=1, retain=False)
     mqttc.reconnect_delay_set(min_delay=1, max_delay=30)
-    
-    # Intentar conectar con reintentos y logging claro
-    max_retries = int(os.environ.get("PABS_MQTT_CONNECT_RETRIES", "5"))
-    retry_delay = float(os.environ.get("PABS_MQTT_RETRY_DELAY", "5"))
+
+    max_retries = int(_env_get(["PABS_MQTT_CONNECT_RETRIES"], "5"))
+    retry_delay = float(_env_get(["PABS_MQTT_RETRY_DELAY"], "5"))
+
     for attempt in range(1, max_retries + 1):
         try:
-            logging.info("Conectando al broker MQTT %s:%s (intento %s/%s)", MQTT_HOST, MQTT_PORT, attempt, max_retries)
-            logging.info("CLIENT_ID único: pabs-tv-%s", CLIENT_ID)
-            mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=60)  # Aumentado a 60 segundos
-            logging.info("Conexión iniciada (connect() devolvió sin excepción)")
+            log.info("Conectando MQTT %s:%s (intento %d/%d)", MQTT_HOST, MQTT_PORT, attempt, max_retries)
+            mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
             break
         except Exception as e:
-            logging.error("Error conectando al broker MQTT %s:%s — %s", MQTT_HOST, MQTT_PORT, e)
+            log.error("MQTT connect error: %s", e)
             if attempt == max_retries:
-                logging.error("No se pudo conectar al broker MQTT después de %s intentos, abortando.", max_retries)
                 sys.exit(1)
-            logging.info("Reintentando en %s segundos...", retry_delay)
             time.sleep(retry_delay)
 
-    # Hilos de reproducción
-    t_loop = threading.Thread(target=lambda: loop_thread_fn(mqttc), daemon=True)
-    t_direct = threading.Thread(target=lambda: direct_thread_fn(mqttc), daemon=True)
-    t_scheduler = threading.Thread(target=lambda: scheduler_thread_fn(mqttc), daemon=True)
-    t_heartbeat = threading.Thread(target=lambda: heartbeat_thread_fn(mqttc), daemon=True)
-    t_loop.start()
-    t_direct.start()
-    t_scheduler.start()
-    t_heartbeat.start()
-    logging.info("✅ Threads iniciados: loop, direct, scheduler, heartbeat")
+    threading.Thread(target=lambda: loop_thread_fn(mqttc), daemon=True).start()
+    threading.Thread(target=lambda: direct_thread_fn(mqttc), daemon=True).start()
+    threading.Thread(target=lambda: scheduler_thread_fn(mqttc), daemon=True).start()
+    threading.Thread(target=lambda: heartbeat_thread_fn(mqttc), daemon=True).start()
 
-    # Opcional: arrancar en loop por defecto con archivo si existe
-    if DEFAULT_PLAYLIST_FILE.exists():
-        set_state(loop_playlist=None, loop_playlist_file=str(DEFAULT_PLAYLIST_FILE))
+    if PLAYLIST_FILE.exists():
+        set_state(loop_playlist=None, loop_playlist_file=str(PLAYLIST_FILE))
         loop_should_run.set()
 
-    # Main loop MQTT
     mqttc.loop_forever()
+
+
+if __name__ == "__main__":
+    main()

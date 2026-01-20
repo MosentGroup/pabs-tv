@@ -1,286 +1,204 @@
 #!/bin/bash
-# =====================================================
-# Script de Instalación Automática de PABS-TV
-# Para Raspberry Pi OS (Debian/Ubuntu)
-# =====================================================
+set -euo pipefail
 
-set -e  # Salir si hay algún error
-
-# Colores para output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Variables
-INSTALL_DIR="$HOME/pabs-tv"
-PYTHON_VERSION="3.9"
-SERVICE_USER="$USER"
-
-# Funciones de utilidad
 print_header() {
-    echo -e "${BLUE}============================================${NC}"
-    echo -e "${BLUE}$1${NC}"
-    echo -e "${BLUE}============================================${NC}"
+  echo -e "${BLUE}============================================${NC}"
+  echo -e "${BLUE}$1${NC}"
+  echo -e "${BLUE}============================================${NC}"
 }
 
-print_success() {
-    echo -e "${GREEN}✓ $1${NC}"
-}
+print_success() { echo -e "${GREEN}✓ $1${NC}"; }
+print_error() { echo -e "${RED}✗ $1${NC}"; }
+print_warning() { echo -e "${YELLOW}⚠ $1${NC}"; }
+print_info() { echo -e "${BLUE}ℹ $1${NC}"; }
 
-print_error() {
-    echo -e "${RED}✗ $1${NC}"
-}
-
-print_warning() {
-    echo -e "${YELLOW}⚠ $1${NC}"
-}
-
-print_info() {
-    echo -e "${BLUE}ℹ $1${NC}"
-}
-
-# Verificar si se ejecuta como root
-if [ "$EUID" -eq 0 ]; then 
-    print_error "No ejecutes este script como root (sin sudo)"
-    print_info "Ejecuta: bash install-raspberry.sh"
-    exit 1
+if [ "${EUID}" -eq 0 ]; then
+  print_error "No ejecutes este script como root."
+  print_info "Ejecuta: bash install-raspberry.sh"
+  exit 1
 fi
 
-# Banner
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="${INSTALL_DIR:-$SCRIPT_DIR}"
+SERVICE_USER="${SERVICE_USER:-$USER}"
+SERVICE_HOME="$(eval echo "~${SERVICE_USER}")"
+
+if [ ! -f "${INSTALL_DIR}/pabs-tv-client2.py" ]; then
+  print_error "No se encontró pabs-tv-client2.py en ${INSTALL_DIR}"
+  print_info "Ejecuta este script desde la raíz del proyecto."
+  exit 1
+fi
+
 clear
 print_header "INSTALADOR DE PABS-TV"
 echo ""
-echo "Este script instalará PABS-TV y todas sus dependencias"
-echo "en tu Raspberry Pi."
+echo "Directorio: ${INSTALL_DIR}"
+echo "Usuario de servicio: ${SERVICE_USER} (${SERVICE_HOME})"
 echo ""
-echo "Directorio de instalación: $INSTALL_DIR"
-echo "Usuario del sistema: $SERVICE_USER"
+
+read -r -p "¿Continuar con la instalación? (s/n) " -n 1 REPLY
 echo ""
-read -p "¿Continuar con la instalación? (s/n) " -n 1 -r
-echo ""
-if [[ ! $REPLY =~ ^[Ss]$ ]]; then
-    print_info "Instalación cancelada"
-    exit 0
+if [[ ! "${REPLY}" =~ ^[Ss]$ ]]; then
+  print_info "Instalación cancelada"
+  exit 0
 fi
 
-# =====================================================
-# PASO 1: Actualizar Sistema
-# =====================================================
 print_header "PASO 1: Actualizando sistema"
-
-print_info "Actualizando lista de paquetes..."
 sudo apt update
-
-print_info "Actualizando paquetes instalados..."
 sudo apt upgrade -y
-
 print_success "Sistema actualizado"
 
-# =====================================================
-# PASO 2: Instalar Dependencias del Sistema
-# =====================================================
 print_header "PASO 2: Instalando dependencias del sistema"
-
 PACKAGES=(
-    "git"
-    "python3"
-    "python3-pip"
-    "python3-venv"
-    "mpv"
-    "cec-utils"
-    "net-tools"
-    "curl"
-    "wget"
+  git
+  python3
+  python3-pip
+  python3-venv
+  mpv
+  cec-utils
+  net-tools
+  mosquitto-clients
+  curl
+  wget
 )
+sudo apt install -y "${PACKAGES[@]}"
+print_success "Paquetes base instalados"
 
-for package in "${PACKAGES[@]}"; do
-    if dpkg -l | grep -q "^ii  $package "; then
-        print_success "$package ya está instalado"
-    else
-        print_info "Instalando $package..."
-        sudo apt install -y "$package"
-        print_success "$package instalado"
-    fi
-done
-
-# yt-dlp (puede no estar en repos antiguos)
-if command -v yt-dlp &> /dev/null; then
-    print_success "yt-dlp ya está instalado"
+if command -v yt-dlp >/dev/null 2>&1; then
+  print_success "yt-dlp ya está instalado"
 else
-    print_info "Instalando yt-dlp..."
-    sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-    sudo chmod a+rx /usr/local/bin/yt-dlp
-    print_success "yt-dlp instalado"
+  print_info "Instalando yt-dlp (binario oficial)..."
+  sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+  sudo chmod a+rx /usr/local/bin/yt-dlp
+  print_success "yt-dlp instalado"
 fi
 
-# rclone (opcional, para Nextcloud)
-read -p "¿Deseas instalar rclone para sincronización con Nextcloud? (s/n) " -n 1 -r
+read -r -p "¿Deseas instalar rclone para sincronización Nextcloud? (s/n) " -n 1 REPLY
 echo ""
-if [[ $REPLY =~ ^[Ss]$ ]]; then
-    if command -v rclone &> /dev/null; then
-        print_success "rclone ya está instalado"
-    else
-        print_info "Instalando rclone..."
-        curl https://rclone.org/install.sh | sudo bash
-        print_success "rclone instalado"
-    fi
+if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
+  if command -v rclone >/dev/null 2>&1; then
+    print_success "rclone ya está instalado"
+  else
+    print_info "Instalando rclone..."
+    curl https://rclone.org/install.sh | sudo bash
+    print_success "rclone instalado"
+  fi
 else
-    print_info "Saltando instalación de rclone"
+  print_info "Saltando rclone"
 fi
 
-print_success "Todas las dependencias del sistema instaladas"
+print_header "PASO 3: Estructura de carpetas"
+mkdir -p "${INSTALL_DIR}/media/videos" "${INSTALL_DIR}/media/images" "${INSTALL_DIR}/cache"
+print_success "Carpetas creadas: media/videos, media/images, cache"
 
-# =====================================================
-# PASO 3: Configurar Directorio del Proyecto
-# =====================================================
-print_header "PASO 3: Configurando directorio del proyecto"
-
-if [ ! -d "$INSTALL_DIR" ]; then
-    print_error "El directorio $INSTALL_DIR no existe"
-    print_info "Este script debe ejecutarse desde el directorio del proyecto clonado"
-    print_info "Ejecuta primero: git clone <tu-repo> $INSTALL_DIR"
-    exit 1
-fi
-
-cd "$INSTALL_DIR"
-print_success "Directorio configurado: $INSTALL_DIR"
-
-# Crear directorios necesarios
-mkdir -p "$INSTALL_DIR/media/videos"
-mkdir -p "$INSTALL_DIR/media/images"
-print_success "Directorios de medios creados"
-
-# =====================================================
-# PASO 4: Configurar Entorno Virtual Python
-# =====================================================
-print_header "PASO 4: Configurando entorno virtual Python"
-
-if [ -d "$INSTALL_DIR/env" ]; then
-    print_warning "Entorno virtual ya existe, se usará el existente"
+print_header "PASO 4: Entorno virtual + dependencias Python"
+if [ ! -d "${INSTALL_DIR}/env" ]; then
+  print_info "Creando entorno virtual..."
+  python3 -m venv "${INSTALL_DIR}/env"
+  print_success "Entorno virtual creado"
 else
-    print_info "Creando entorno virtual..."
-    python3 -m venv "$INSTALL_DIR/env"
-    print_success "Entorno virtual creado"
+  print_warning "Entorno virtual existente, se reutiliza"
 fi
 
-# Activar entorno virtual
-source "$INSTALL_DIR/env/bin/activate"
+# shellcheck disable=SC1091
+source "${INSTALL_DIR}/env/bin/activate"
+python3 -m pip install --upgrade pip
+python3 -m pip install -r "${INSTALL_DIR}/requirements.txt"
+print_success "Dependencias Python instaladas"
 
-# Actualizar pip
-print_info "Actualizando pip..."
-pip install --upgrade pip
-
-# Instalar dependencias Python
-print_info "Instalando dependencias Python..."
-if [ -f "$INSTALL_DIR/requirements.txt" ]; then
-    pip install -r "$INSTALL_DIR/requirements.txt"
-    print_success "Dependencias Python instaladas"
+print_header "PASO 5: Variables de entorno (.env)"
+ENV_FILE="${INSTALL_DIR}/.env"
+if [ -f "${ENV_FILE}" ]; then
+  print_warning ".env ya existe: ${ENV_FILE}"
 else
-    print_warning "No se encontró requirements.txt, instalando paquetes básicos..."
-    pip install paho-mqtt yt-dlp python-dotenv
-fi
+  print_info "Creando .env base..."
+  cat > "${ENV_FILE}" <<EOF
+# Identificación
+PABS_CLIENT_ID=pabs-tv-01
 
-print_success "Entorno Python configurado"
+# MQTT (nombres canon)
+PABS_MQTT_HOST=localhost
+PABS_MQTT_PORT=1883
+PABS_MQTT_USER=
+PABS_MQTT_PASS=
+PABS_TOPIC_BASE=pabs-tv
 
-# =====================================================
-# PASO 5: Configurar Variables de Entorno
-# =====================================================
-print_header "PASO 5: Configurando variables de entorno"
+# Paths
+PABS_PROJECT_DIR=${INSTALL_DIR}
+PABS_MEDIA_DIR=${INSTALL_DIR}/media
+PABS_PLAYLIST_FILE=${INSTALL_DIR}/playlist.json
 
-if [ -f "$INSTALL_DIR/.env" ]; then
-    print_warning "Archivo .env ya existe"
-    read -p "¿Deseas sobrescribirlo? (s/n) " -n 1 -r
-    echo ""
-    if [[ ! $REPLY =~ ^[Ss]$ ]]; then
-        print_info "Manteniendo archivo .env existente"
-        SKIP_ENV=true
-    fi
-fi
-
-if [ "$SKIP_ENV" != true ]; then
-    print_info "Creando archivo .env de ejemplo..."
-    cat > "$INSTALL_DIR/.env" << 'EOF'
-# Identificación del cliente
-PABS_CLIENT_ID=sala-01-raspberry
-
-# Configuración MQTT
-MQTT_BROKER=localhost
-MQTT_PORT=1883
-MQTT_USER=
-MQTT_PASSWORD=
-MQTT_TOPIC_BASE=pabs-tv
-
-# Configuración de logs
+# Logs
 PABS_LOGFILE=/tmp/pabs-tv-client.log
+PABS_MPV_LOGFILE=/tmp/mpv.log
 
-# Rutas de medios
-MEDIA_DIR=/home/pi/pabs-tv/media
+# Display (ajustar según tu entorno)
+DISPLAY=:0
+# XDG_SESSION_TYPE=wayland
+# WAYLAND_DISPLAY=wayland-0
+
+# MPV (vacío = dejar que mpv decida / use mpv.conf)
+# PABS_MPV_VO=x11
+# PABS_MPV_GPU_CONTEXT=x11
+PABS_MPV_HWDEC=no
+PABS_MPV_YTDL_FORMAT=bestvideo[height<=720]+bestaudio/best/best
+PABS_MPV_EXTRA_OPTS=
 EOF
-    print_success "Archivo .env creado"
-    print_warning "IMPORTANTE: Edita el archivo .env con tus configuraciones"
-    print_info "Ejecuta: nano $INSTALL_DIR/.env"
+  print_success ".env creado"
+  print_warning "Edita .env antes de producción: nano ${ENV_FILE}"
 fi
 
-# =====================================================
-# PASO 6: Configurar Playlist
-# =====================================================
-print_header "PASO 6: Configurando playlist"
-
-if [ -f "$INSTALL_DIR/playlist.json" ]; then
-    print_success "playlist.json ya existe"
+print_header "PASO 6: Playlist"
+if [ -f "${INSTALL_DIR}/playlist.json" ]; then
+  print_success "playlist.json ya existe"
 else
-    if [ -f "$INSTALL_DIR/playlist-example-with-schedule.json" ]; then
-        print_info "Copiando playlist de ejemplo..."
-        cp "$INSTALL_DIR/playlist-example-with-schedule.json" "$INSTALL_DIR/playlist.json"
-        print_success "playlist.json creado desde ejemplo"
-    else
-        print_info "Creando playlist.json básico..."
-        cat > "$INSTALL_DIR/playlist.json" << 'EOF'
+  print_info "Creando playlist.json de ejemplo..."
+  cat > "${INSTALL_DIR}/playlist.json" <<'EOF'
 {
   "schedule_enabled": true,
   "schedule_start": "08:00",
   "schedule_end": "22:00",
   "show_time": true,
-  "list": [
-    {
-      "type": "image",
-      "src": "media/images/ejemplo.jpg",
-      "duration": 10
-    }
+  "items": [
+    { "kind": "image", "src": "media/images/ejemplo.jpg", "duration": 10 },
+    { "kind": "video", "src": "media/videos/ejemplo.mp4", "duration": 30 }
   ]
 }
 EOF
-        print_success "playlist.json creado"
-        print_warning "Agrega tus videos e imágenes a la playlist"
-    fi
+  print_success "playlist.json creado"
 fi
 
-# =====================================================
-# PASO 7: Configurar Servicio Systemd
-# =====================================================
-print_header "PASO 7: Configurando servicio systemd"
-
-read -p "¿Deseas configurar PABS-TV como servicio del sistema? (s/n) " -n 1 -r
+print_header "PASO 7: Servicio systemd"
+read -r -p "¿Deseas configurar PABS-TV como servicio systemd? (s/n) " -n 1 REPLY
 echo ""
-if [[ $REPLY =~ ^[Ss]$ ]]; then
-    print_info "Creando archivo de servicio..."
-    
-    sudo tee /etc/systemd/system/pabs-tv.service > /dev/null << EOF
+if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
+  SERVICE_FILE="/etc/systemd/system/pabs-tv.service"
+  print_info "Creando servicio en ${SERVICE_FILE}..."
+
+  sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
 Description=PABS-TV Digital Signage Client
-After=network-online.target
+After=network-online.target display-manager.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=$SERVICE_USER
-WorkingDirectory=$INSTALL_DIR
-Environment="PATH=$INSTALL_DIR/env/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=$INSTALL_DIR/env/bin/python3 $INSTALL_DIR/pabs-tv-client2.py
-Restart=always
-RestartSec=10
+User=${SERVICE_USER}
+WorkingDirectory=${INSTALL_DIR}
+EnvironmentFile=${ENV_FILE}
+Environment="PATH=${INSTALL_DIR}/env/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="HOME=${SERVICE_HOME}"
+Environment="XDG_CONFIG_HOME=${SERVICE_HOME}/.config"
+Environment="XDG_RUNTIME_DIR=/run/user/%U"
+ExecStart=${INSTALL_DIR}/env/bin/python3 ${INSTALL_DIR}/pabs-tv-client2.py
+Restart=on-failure
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
@@ -288,113 +206,31 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    print_success "Servicio creado"
-    
-    print_info "Habilitando servicio..."
-    sudo systemctl daemon-reload
-    sudo systemctl enable pabs-tv.service
-    print_success "Servicio habilitado"
-    
-    read -p "¿Deseas iniciar el servicio ahora? (s/n) " -n 1 -r
-    echo ""
-    if [[ $REPLY =~ ^[Ss]$ ]]; then
-        sudo systemctl start pabs-tv.service
-        sleep 2
-        if sudo systemctl is-active --quiet pabs-tv.service; then
-            print_success "Servicio iniciado correctamente"
-        else
-            print_error "Error al iniciar el servicio"
-            print_info "Revisa los logs: journalctl -u pabs-tv.service -n 50"
-        fi
+  sudo systemctl daemon-reload
+  sudo systemctl enable pabs-tv.service
+  print_success "Servicio habilitado"
+
+  read -r -p "¿Iniciar el servicio ahora? (s/n) " -n 1 REPLY
+  echo ""
+  if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
+    sudo systemctl restart pabs-tv.service
+    sleep 2
+    if sudo systemctl is-active --quiet pabs-tv.service; then
+      print_success "Servicio iniciado"
+    else
+      print_error "El servicio no inició"
+      print_info "Logs: journalctl -u pabs-tv.service -n 150 --no-pager"
     fi
+  fi
 else
-    print_info "Saltando configuración de servicio"
-    print_info "Puedes iniciar manualmente con: python3 pabs-tv-client2.py"
+  print_info "Saltando systemd"
 fi
 
-# =====================================================
-# PASO 8: Verificar Instalación
-# =====================================================
-print_header "PASO 8: Verificando instalación"
-
-print_info "Verificando componentes..."
-
-# Verificar Python
-if python3 --version &> /dev/null; then
-    PYTHON_VER=$(python3 --version)
-    print_success "Python: $PYTHON_VER"
-else
-    print_error "Python no encontrado"
-fi
-
-# Verificar MPV
-if command -v mpv &> /dev/null; then
-    MPV_VER=$(mpv --version | head -n 1)
-    print_success "MPV: $MPV_VER"
-else
-    print_error "MPV no encontrado"
-fi
-
-# Verificar yt-dlp
-if command -v yt-dlp &> /dev/null; then
-    YT_VER=$(yt-dlp --version)
-    print_success "yt-dlp: $YT_VER"
-else
-    print_warning "yt-dlp no encontrado"
-fi
-
-# Verificar CEC
-if command -v cec-client &> /dev/null; then
-    print_success "cec-utils: instalado"
-else
-    print_warning "cec-utils no encontrado"
-fi
-
-# Verificar archivos
-if [ -f "$INSTALL_DIR/.env" ]; then
-    print_success "Archivo .env: existe"
-else
-    print_warning "Archivo .env: no encontrado"
-fi
-
-if [ -f "$INSTALL_DIR/playlist.json" ]; then
-    print_success "Archivo playlist.json: existe"
-else
-    print_warning "Archivo playlist.json: no encontrado"
-fi
-
-# =====================================================
-# RESUMEN
-# =====================================================
 print_header "INSTALACIÓN COMPLETADA"
-
 echo ""
-echo -e "${GREEN}✓ PABS-TV ha sido instalado correctamente${NC}"
+echo "Siguientes pasos:"
+echo "1) Edita .env: nano ${ENV_FILE}"
+echo "2) Edita playlist: nano ${INSTALL_DIR}/playlist.json"
+echo "3) Logs: journalctl -u pabs-tv.service -f"
 echo ""
-echo "Próximos pasos:"
-echo ""
-echo "1. Configurar MQTT en el archivo .env:"
-echo "   nano $INSTALL_DIR/.env"
-echo ""
-echo "2. Editar la playlist:"
-echo "   nano $INSTALL_DIR/playlist.json"
-echo ""
-echo "3. Agregar archivos multimedia:"
-echo "   - Videos en: $INSTALL_DIR/media/videos/"
-echo "   - Imágenes en: $INSTALL_DIR/media/images/"
-echo ""
-echo "4. Ver estado del servicio:"
-echo "   sudo systemctl status pabs-tv.service"
-echo ""
-echo "5. Ver logs en tiempo real:"
-echo "   journalctl -u pabs-tv.service -f"
-echo ""
-echo "6. Reiniciar servicio después de cambios:"
-echo "   sudo systemctl restart pabs-tv.service"
-echo ""
-echo "7. Ejecutar diagnóstico:"
-echo "   cd $INSTALL_DIR && bash check-mqtt-connections.sh"
-echo ""
-echo -e "${BLUE}Para más información, consulta: INSTALACION_RASPBERRY.md${NC}"
-echo ""
-print_success "¡Disfruta de PABS-TV! 🎉"
+print_success "Listo"
