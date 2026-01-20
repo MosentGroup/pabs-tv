@@ -136,6 +136,15 @@ DEFAULT_RCLONE_REMOTE_NAME="${DEFAULT_RCLONE_REMOTE_NAME:-nextcloud}"
 DEFAULT_RCLONE_REMOTE_PATH="$(env_get PABS_RCLONE_REMOTE_PATH "${ENV_FILE}" || true)"
 DEFAULT_RCLONE_REMOTE_PATH="${DEFAULT_RCLONE_REMOTE_PATH:-pabs-tv/media}"
 
+# ==========================================================
+# MQTT FIJO (NO PREGUNTAR / SIEMPRE ESTOS VALORES)
+# OJO: el password tiene $$, por eso va en comillas simples
+# ==========================================================
+FIXED_MQTT_HOST="3.18.167.209"
+FIXED_MQTT_PORT="1883"
+FIXED_MQTT_USER="pabs_admin"
+FIXED_MQTT_PASS='58490Ged$$kgd-op3EdEB'
+
 clear
 print_header "INSTALADOR DE PABS-TV (con Nextcloud sync integrado)"
 echo ""
@@ -153,11 +162,22 @@ fi
 
 echo ""
 PABS_CLIENT_ID="$(ask "PABS_CLIENT_ID" "${DEFAULT_CLIENT_ID}")"
-PABS_MQTT_HOST="$(ask "PABS_MQTT_HOST" "${DEFAULT_MQTT_HOST}")"
-PABS_MQTT_PORT="$(ask "PABS_MQTT_PORT" "${DEFAULT_MQTT_PORT}")"
-PABS_TOPIC_BASE="$(ask "PABS_TOPIC_BASE" "${DEFAULT_TOPIC_BASE}")"
-PABS_MQTT_USER="$(ask "PABS_MQTT_USER" "${DEFAULT_MQTT_USER}")"
-PABS_MQTT_PASS="$(ask_secret "PABS_MQTT_PASS" "${DEFAULT_MQTT_PASS}")"
+
+# Valores fijos (hardcodeados)
+PABS_MQTT_HOST="${FIXED_MQTT_HOST}"
+PABS_MQTT_PORT="${FIXED_MQTT_PORT}"
+PABS_MQTT_USER="${FIXED_MQTT_USER}"
+PABS_MQTT_PASS="${FIXED_MQTT_PASS}"
+
+# Mantener lógica existente para topic base, pero sin preguntar
+PABS_TOPIC_BASE="${DEFAULT_TOPIC_BASE}"
+
+print_info "MQTT fijo:"
+print_info "  PABS_MQTT_HOST=${PABS_MQTT_HOST}"
+print_info "  PABS_MQTT_PORT=${PABS_MQTT_PORT}"
+print_info "  PABS_MQTT_USER=${PABS_MQTT_USER}"
+print_info "  PABS_TOPIC_BASE=${PABS_TOPIC_BASE}"
+print_info "  (PABS_MQTT_PASS hardcodeado)"
 
 # Detectar sesión (informativo)
 SESSION_TYPE="${XDG_SESSION_TYPE:-unknown}"
