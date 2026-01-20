@@ -1,383 +1,235 @@
 
-````md
-# 🍓 Guía de Instalación PABS-TV en Raspberry Pi
+# 🍓 Guía de Instalación PABS-TV en Raspberry Pi (Paso a Paso)
 
-Este documento deja PABS-TV **instalado como servicio systemd**, con `.env` cargado correctamente y con una configuración de display/mpv que evita los errores típicos al correr como servicio.
+Esta guía deja PABS-TV instalado como **servicio systemd**, cargando `.env` correctamente y con configuración de entorno para que **mpv pueda abrir display** cuando corre como servicio (no solo en terminal).
 
 ---
 
-## 📌 Requisitos
+## 0) Requisitos y Suposiciones
 
+### Hardware / OS
 - Raspberry Pi 3+ (recomendado Pi 4 / 2GB+)
-- Raspberry Pi OS (Desktop recomendado si vas a reproducir en pantalla local)
-- Acceso a Internet
-- Acceso SSH o monitor/teclado
-- Broker MQTT accesible (host/puerto/credenciales)
+- Raspberry Pi OS (Desktop recomendado si se reproduce en HDMI local)
+- SD 16GB+ (recomendado 32GB)
+
+### Acceso
+- SSH o monitor/teclado
+- Internet
+
+### MQTT
+- Host/puerto/credenciales del broker
+- Un **CLIENT_ID único** por pantalla (para no “pisarse”)
 
 ---
 
-## ✅ Variables de entorno (canon)
+## 1) Preparación del sistema (Raspberry Pi OS)
 
-Archivo: `~/pabs-tv/.env`
+### 1.1 Actualizar paquetes
+```bash
+sudo apt update
+sudo apt upgrade -y
+sudo apt autoremove -y
+````
 
-**MQTT**
-- `PABS_CLIENT_ID` (obligatorio recomendado) → ID único por pantalla
-- `PABS_MQTT_HOST`
-- `PABS_MQTT_PORT`
-- `PABS_MQTT_USER`
-- `PABS_MQTT_PASS`
-- `PABS_TOPIC_BASE` (default: `pabs-tv`)
+### 1.2 Instalar dependencias del sistema
 
-**Rutas**
-- `PABS_PROJECT_DIR` (default: raíz del repo)
-- `PABS_MEDIA_DIR` (default: `<repo>/media`)
-- `PABS_PLAYLIST_FILE` (default: `<repo>/playlist.json`)
-- `PABS_CACHE_DIR` (default: `<repo>/cache`)
+```bash
+sudo apt install -y \
+  git \
+  python3 python3-pip python3-venv \
+  mpv \
+  cec-utils \
+  net-tools \
+  mosquitto-clients \
+  curl wget
+```
 
-**Logs**
-- `PABS_LOGFILE` (default: `/tmp/pabs-tv-client.log`)
-- `PABS_MPV_LOGFILE` (default: `/tmp/mpv.log`)
+Verifica:
 
-**Display (cuando corre como servicio)**
-- `DISPLAY` (normalmente `:0`)
-- `XDG_RUNTIME_DIR` (systemd lo puede resolver con `/run/user/%U`)
-- Opcional si aplica:
-  - `XDG_SESSION_TYPE=wayland`
-  - `WAYLAND_DISPLAY=wayland-0`
-
-**MPV (recomendado)**
-- `PABS_MPV_VO` (vacío = no forzar; mpv decide / usa `mpv.conf`)
-- `PABS_MPV_GPU_CONTEXT` (vacío = no forzar)
-- `PABS_MPV_HWDEC` (default: `no`)
-- `PABS_MPV_YTDL_FORMAT` (default: `bestvideo[height<=720]+bestaudio/best/best`)
-- `PABS_MPV_EXTRA_OPTS` (opcional; flags adicionales de mpv)
-
-> Compatibilidad legacy: el cliente también acepta `CLIENT_ID`, `MQTT_BROKER`, `MQTT_PORT`, `MQTT_USER`, `MQTT_PASSWORD`, `MQTT_TOPIC_BASE`.
+```bash
+python3 --version
+mpv --version | head -n 1
+```
 
 ---
 
-## 🚀 Instalación Rápida (recomendado)
+## 2) Clonar el proyecto
 
-### 1) Clonar repositorio
+### 2.1 Elegir directorio de instalación
+
+Esta guía asume que se instala en:
+
+* `~/pabs-tv`
+
+Clonar:
+
 ```bash
 cd ~
 git clone https://github.com/MosentGroup/pabs-tv.git
 cd pabs-tv
-````
-
-### 2) Ejecutar instalador
-
-```bash
-chmod +x install-raspberry.sh
-bash install-raspberry.sh
 ```
 
-El instalador:
-
-* Instala dependencias del sistema
-* Crea `env/` (venv) e instala requirements
-* Crea `media/videos`, `media/images`, `cache`
-* Crea `.env` base (si no existe)
-* Crea y habilita `pabs-tv.service` (opcional)
-
-### 3) Editar `.env`
+Verifica que estés en el repo:
 
 ```bash
-nano ~/pabs-tv/.env
+ls -la
 ```
 
-Ejemplo mínimo:
+---
+
+## 3) Crear entorno virtual (venv) e instalar dependencias Python
+
+### 3.1 Crear venv
+
+```bash
+python3 -m venv env
+```
+
+### 3.2 Activar venv
+
+```bash
+source env/bin/activate
+```
+
+Verifica:
+
+```bash
+which python
+python --version
+```
+
+### 3.3 Instalar requirements
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+> Si tu código usa dotenv, asegúrate de que `python-dotenv` esté en requirements (si no está, agrégalo y reinstala).
+> En una instalación ya estable, se recomienda que `requirements.txt` incluya lo necesario para ejecutar.
+
+---
+
+## 4) Estructura de carpetas del proyecto (media/cache)
+
+Crea la estructura requerida:
+
+```bash
+mkdir -p media/videos
+mkdir -p media/images
+mkdir -p cache
+```
+
+Verifica:
+
+```bash
+find media -maxdepth 2 -type d -print
+```
+
+---
+
+## 5) Configuración `.env`
+
+Archivo: `~/pabs-tv/.env`
+
+### 5.1 Crear `.env` (si no existe)
+
+```bash
+cd ~/pabs-tv
+test -f .env || nano .env
+```
+
+### 5.2 Variables de entorno (canon)
+
+**MQTT**
+
+* `PABS_CLIENT_ID` (recomendado obligatorio) → ID único por pantalla
+* `PABS_MQTT_HOST`
+* `PABS_MQTT_PORT`
+* `PABS_MQTT_USER`
+* `PABS_MQTT_PASS`
+* `PABS_TOPIC_BASE` (default recomendado: `pabs-tv`)
+
+**Logs**
+
+* `PABS_LOGFILE` (default: `/tmp/pabs-tv-client.log`)
+* `PABS_MPV_LOGFILE` (default: `/tmp/mpv.log`)
+
+**Display (cuando corre como servicio)**
+
+* `DISPLAY` (normalmente `:0`)
+* Opcional si aplica (solo si tu sesión es Wayland):
+
+  * `XDG_SESSION_TYPE=wayland`
+  * `WAYLAND_DISPLAY=wayland-0`
+
+**MPV (recomendado)**
+
+* `PABS_MPV_HWDEC` (default: `no`)
+* `PABS_MPV_YTDL_FORMAT` (default recomendado)
+* `PABS_MPV_VO` (vacío = no forzar)
+* `PABS_MPV_GPU_CONTEXT` (vacío = no forzar)
+
+> Compatibilidad legacy: el cliente también acepta `CLIENT_ID`, `MQTT_BROKER`, `MQTT_PORT`, `MQTT_USER`, `MQTT_PASSWORD`, `MQTT_TOPIC_BASE`.
+
+### 5.3 Ejemplo mínimo funcional (copiar/pegar y editar)
 
 ```env
+# ===== Identidad (UNICO por pantalla) =====
 PABS_CLIENT_ID=pabstv-sala-01
+
+# ===== MQTT =====
 PABS_MQTT_HOST=tu-broker.com
 PABS_MQTT_PORT=1883
 PABS_MQTT_USER=usuario
 PABS_MQTT_PASS=password
 PABS_TOPIC_BASE=pabs-tv
 
+# ===== Logs =====
+PABS_LOGFILE=/tmp/pabs-tv-client.log
+PABS_MPV_LOGFILE=/tmp/mpv.log
+
+# ===== Display (HDMI local) =====
 DISPLAY=:0
+
+# Si tu sesión gráfica es Wayland, descomenta:
+# XDG_SESSION_TYPE=wayland
+# WAYLAND_DISPLAY=wayland-0
+
+# ===== MPV =====
 PABS_MPV_HWDEC=no
-```
-
-### 4) Reiniciar servicio
-
-```bash
-sudo systemctl restart pabs-tv.service
-sudo systemctl status pabs-tv.service
-```
-
-Logs:
-
-```bash
-journalctl -u pabs-tv.service -f
+PABS_MPV_YTDL_FORMAT=bestvideo[height<=720]+bestaudio/best/best
 ```
 
 ---
 
-## 🧩 Playlist
+## 6) Playlist (`playlist.json`)
 
 Archivo: `~/pabs-tv/playlist.json`
+
+### 6.1 Crear/editar
+
+```bash
+cd ~/pabs-tv
+nano playlist.json
+```
+
+### 6.2 Formato
 
 El cliente acepta:
 
 * `items` (preferido)
 * `list` (compatibilidad; el cliente lo normaliza)
 
-Cada item puede usar:
+Cada item acepta:
 
 * `kind` (preferido) o `type` (compatibilidad): `image` | `video` | `youtube`
-* `src`: ruta o URL
-* `duration`: para imágenes (mpv image-display-duration)
-* `start_at`: para videos/youtube
-* `prefetch`: para youtube (descarga al cache y reproduce local)
-
-Ejemplo:
-
-```json
-{
-  "schedule_enabled": true,
-  "schedule_start": "08:00",
-  "schedule_end": "22:00",
-  "show_time": true,
-  "items": [
-    { "kind": "image", "src": "media/images/ejemplo.jpg", "duration": 10 },
-    { "kind": "video", "src": "media/videos/ejemplo.mp4" },
-    { "kind": "youtube", "src": "https://www.youtube.com/watch?v=XXXX", "prefetch": true }
-  ]
-}
-```
-
----
-
-## 🧠 Diagnóstico rápido
-
-### Estado del servicio
-
-```bash
-sudo systemctl status pabs-tv.service
-```
-
-### Logs del servicio (últimos 200)
-
-```bash
-journalctl -u pabs-tv.service -n 200 --no-pager
-```
-
-### Logs de mpv
-
-```bash
-tail -n 200 /tmp/mpv.log
-```
-
-### Confirmar que el servicio “ve” el display
-
-```bash
-sudo -u "$USER" DISPLAY=:0 xset q
-```
-
-Si esto falla con “unable to open display”, entonces el problema está en:
-
-* no hay sesión gráfica (modo Lite/console sin X)
-* `DISPLAY` incorrecto
-* permisos de sesión gráfica
-
----
-
-## 🎮 Control por MQTT (acciones)
-
-Topic de comandos:
-
-* `${PABS_TOPIC_BASE}/${PABS_CLIENT_ID}/cmd`
-
-Ejemplos de payload:
-
-Loop:
-
-```json
-{ "action": "loop.start" }
-```
-
-Stop:
-
-```json
-{ "action": "loop.stop" }
-```
-
-Reproducir una vez:
-
-```json
-{
-  "action": "play.once",
-  "item": { "kind": "video", "src": "media/videos/ejemplo.mp4" },
-  "return_to_loop": true
-}
-```
-
-Horario:
-
-```json
-{ "action": "loop.schedule", "enabled": true, "start_time": "08:00", "end_time": "22:00" }
-```
-
-Encender/apagar TV:
-
-```json
-{ "action": "tv.power", "state": "on" }
-```
-
-```json
-{ "action": "tv.power", "state": "off" }
-```
-
----
-
-## 🧱 Instalación Manual (si no quieres script)
-
-### Dependencias del sistema
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y git python3 python3-pip python3-venv mpv cec-utils net-tools mosquitto-clients curl wget
-```
-
-### Repo + venv
-
-```bash
-cd ~
-git clone https://github.com/MosentGroup/pabs-tv.git
-cd pabs-tv
-python3 -m venv env
-source env/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### Carpetas
-
-```bash
-mkdir -p media/videos media/images cache
-```
-
-### Servicio systemd
-
-```bash
-sudo nano /etc/systemd/system/pabs-tv.service
-```
-
-Contenido recomendado:
-
-```ini
-[Unit]
-Description=PABS-TV Digital Signage Client
-After=network-online.target display-manager.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/pabs-tv
-EnvironmentFile=/home/pi/pabs-tv/.env
-Environment="PATH=/home/pi/pabs-tv/env/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="HOME=/home/pi"
-Environment="XDG_CONFIG_HOME=/home/pi/.config"
-Environment="XDG_RUNTIME_DIR=/run/user/%U"
-ExecStart=/home/pi/pabs-tv/env/bin/python3 /home/pi/pabs-tv/pabs-tv-client2.py
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Activar:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable pabs-tv.service
-sudo systemctl start pabs-tv.service
-```
-
----
-
-## ✅ Checklist
-
-* [ ] `.env` con `PABS_CLIENT_ID` único por Raspberry
-* [ ] MQTT host/port correctos
-* [ ] `DISPLAY=:0` si reproduce en pantalla local
-* [ ] `playlist.json` con `items`/`list`
-* [ ] `systemctl status pabs-tv.service` OK
-* [ ] `tail -f /tmp/mpv.log` sin errores de `--vo`
-
----
-
-````
-
-
----
-
-## `README_INSTALACION.md` (reemplazar completo)
-
-```md
-# 🍓 PABS-TV — Instalación Rápida (Raspberry Pi)
-
-## Instalación en 3 pasos
-
-### 1) Clonar
-```bash
-cd ~
-git clone https://github.com/MosentGroup/pabs-tv.git
-cd pabs-tv
-````
-
-### 2) Ejecutar instalador
-
-```bash
-chmod +x install-raspberry.sh
-bash install-raspberry.sh
-```
-
-### 3) Configurar y reiniciar
-
-```bash
-nano .env
-nano playlist.json
-sudo systemctl restart pabs-tv.service
-```
-
-Logs:
-
-```bash
-journalctl -u pabs-tv.service -f
-```
-
----
-
-## Variables mínimas (`.env`)
-
-Archivo: `~/pabs-tv/.env`
-
-```env
-PABS_CLIENT_ID=pabstv-sala-01
-PABS_MQTT_HOST=tu-broker.com
-PABS_MQTT_PORT=1883
-PABS_MQTT_USER=
-PABS_MQTT_PASS=
-PABS_TOPIC_BASE=pabs-tv
-
-DISPLAY=:0
-PABS_MPV_HWDEC=no
-```
-
----
-
-## Playlist (`playlist.json`)
-
-Formato recomendado:
-
-* `items` (aunque acepta `list` por compatibilidad)
+* `src` (ruta o URL)
+* `duration` (para imágenes)
+* `start_at` (videos/youtube)
+* `prefetch` (youtube; descarga al cache y reproduce local)
+
+Ejemplo recomendado:
 
 ```json
 {
@@ -392,79 +244,201 @@ Formato recomendado:
 }
 ```
 
+> Copia tus archivos a:
+
+* `~/pabs-tv/media/images/`
+* `~/pabs-tv/media/videos/`
+
 ---
 
-## Comandos útiles
+## 7) Crear el servicio systemd (final)
 
-Estado:
+Archivo: `/etc/systemd/system/pabs-tv.service`
+
+### 7.1 Crear/editar unit
+
+```bash
+sudo nano /etc/systemd/system/pabs-tv.service
+```
+
+### 7.2 Contenido FINAL (copiar/pegar)
+
+> Ajusta solo si tus rutas/usuario cambian.
+
+```ini
+[Unit]
+Description=PABS-TV Digital Signage Client
+After=network-online.target display-manager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pabstvroot
+WorkingDirectory=/home/pabstvroot/pabs-tv
+
+EnvironmentFile=-/home/pabstvroot/pabs-tv/.env
+
+Environment="PATH=/home/pabstvroot/pabs-tv/env/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="HOME=/home/pabstvroot"
+Environment="XDG_CONFIG_HOME=/home/pabstvroot/.config"
+Environment="XDG_RUNTIME_DIR=/run/user/%U"
+
+Environment="DISPLAY=:0"
+Environment="XDG_SESSION_TYPE=wayland"
+Environment="WAYLAND_DISPLAY=wayland-0"
+
+ExecStart=/home/pabstvroot/pabs-tv/env/bin/python3 /home/pabstvroot/pabs-tv/pabs-tv-client2.py
+
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> Si tu Raspberry NO usa Wayland (X11), comenta en el servicio:
+
+* `XDG_SESSION_TYPE=wayland`
+* `WAYLAND_DISPLAY=wayland-0`
+
+y deja `DISPLAY=:0`.
+
+### 7.3 Recargar systemd, habilitar y arrancar
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable pabs-tv.service
+sudo systemctl restart pabs-tv.service
+```
+
+### 7.4 Confirmar estado
 
 ```bash
 sudo systemctl status pabs-tv.service
 ```
 
-Reiniciar:
+Logs:
 
 ```bash
-sudo systemctl restart pabs-tv.service
+journalctl -u pabs-tv.service -f
 ```
 
-Logs (últimos 200):
+---
+
+## 8) Verificación de display (clave para mpv)
+
+### 8.1 Verificar variables básicas (en tu sesión)
+
+```bash
+echo "$DISPLAY"
+echo "$XDG_SESSION_TYPE"
+```
+
+### 8.2 Probar que el usuario del servicio puede abrir display
+
+Cambia `pabstvroot` por tu usuario real:
+
+```bash
+sudo -u pabstvroot DISPLAY=:0 xset q
+```
+
+Si responde con información (y no error), el servicio puede “ver” el display.
+
+---
+
+## 9) Diagnóstico de errores típicos
+
+### 9.1 Ver últimos 200 logs del servicio
 
 ```bash
 journalctl -u pabs-tv.service -n 200 --no-pager
 ```
 
-Logs mpv:
+### 9.2 Buscar errores comunes de video/vo
+
+```bash
+journalctl -u pabs-tv.service -n 400 --no-pager | grep -E "Failed initializing|Video: no video|Error opening|vo="
+```
+
+### 9.3 Ver logs de mpv
 
 ```bash
 tail -n 200 /tmp/mpv.log
 ```
 
-Verificar display:
+---
+
+## 10) Pruebas MQTT rápidas
+
+Topic de comandos:
+
+* `${PABS_TOPIC_BASE}/${PABS_CLIENT_ID}/cmd`
+
+### 10.1 Loop start
 
 ```bash
-sudo -u "$USER" DISPLAY=:0 xset q
+mosquitto_pub -h tu-broker.com -p 1883 \
+  -t "pabs-tv/pabstv-sala-01/cmd" \
+  -m '{"action":"loop.start"}'
+```
+
+### 10.2 Play once
+
+```bash
+mosquitto_pub -h tu-broker.com -p 1883 \
+  -t "pabs-tv/pabstv-sala-01/cmd" \
+  -m '{"action":"play.once","item":{"kind":"video","src":"media/videos/ejemplo.mp4"},"return_to_loop":true}'
+```
+
+### 10.3 Apagar/encender TV (si aplica)
+
+```bash
+mosquitto_pub -h tu-broker.com -p 1883 \
+  -t "pabs-tv/pabstv-sala-01/cmd" \
+  -m '{"action":"tv.power","state":"on"}'
+```
+
+```bash
+mosquitto_pub -h tu-broker.com -p 1883 \
+  -t "pabs-tv/pabstv-sala-01/cmd" \
+  -m '{"action":"tv.power","state":"off"}'
 ```
 
 ---
 
-## Acciones MQTT
+## 11) Instalación usando `install-raspberry.sh` (modo guiado)
 
-Topic:
+Si prefieres automático:
 
-* `pabs-tv/<CLIENT_ID>/cmd`
-
-Loop:
-
-```json
-{ "action": "loop.start" }
+```bash
+cd ~/pabs-tv
+chmod +x install-raspberry.sh
+bash install-raspberry.sh
 ```
 
-Stop:
+Después:
 
-```json
-{ "action": "loop.stop" }
-```
-
-Play once:
-
-```json
-{
-  "action": "play.once",
-  "item": { "kind": "video", "src": "media/videos/ejemplo.mp4" },
-  "return_to_loop": true
-}
-```
-
-TV Power:
-
-```json
-{ "action": "tv.power", "state": "on" }
+```bash
+nano .env
+nano playlist.json
+sudo systemctl restart pabs-tv.service
+journalctl -u pabs-tv.service -f
 ```
 
 ---
 
-```
+## 12) Checklist final
+
+* [ ] `~/pabs-tv/.env` con `PABS_CLIENT_ID` único
+* [ ] MQTT configurado y accesible
+* [ ] Carpetas creadas: `media/videos`, `media/images`, `cache`
+* [ ] `playlist.json` válido (con `items` o `list`)
+* [ ] Servicio creado: `/etc/systemd/system/pabs-tv.service`
+* [ ] `systemctl status pabs-tv.service` OK
+* [ ] `sudo -u <user> DISPLAY=:0 xset q` responde OK
+* [ ] `tail -f /tmp/mpv.log` sin errores de `--vo`
 
 ---
-```
+

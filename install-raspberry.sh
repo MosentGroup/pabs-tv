@@ -52,6 +52,7 @@ fi
 print_header "PASO 1: Actualizando sistema"
 sudo apt update
 sudo apt upgrade -y
+sudo apt autoremove -y
 print_success "Sistema actualizado"
 
 print_header "PASO 2: Instalando dependencias del sistema"
@@ -119,31 +120,34 @@ if [ -f "${ENV_FILE}" ]; then
 else
   print_info "Creando .env base..."
   cat > "${ENV_FILE}" <<EOF
-# Identificación
+# ===== Identificación =====
 PABS_CLIENT_ID=pabs-tv-01
 
-# MQTT (nombres canon)
+# ===== MQTT (nombres canon) =====
 PABS_MQTT_HOST=localhost
 PABS_MQTT_PORT=1883
 PABS_MQTT_USER=
 PABS_MQTT_PASS=
 PABS_TOPIC_BASE=pabs-tv
 
-# Paths
+# ===== Paths =====
 PABS_PROJECT_DIR=${INSTALL_DIR}
 PABS_MEDIA_DIR=${INSTALL_DIR}/media
 PABS_PLAYLIST_FILE=${INSTALL_DIR}/playlist.json
+PABS_CACHE_DIR=${INSTALL_DIR}/cache
 
-# Logs
+# ===== Logs =====
 PABS_LOGFILE=/tmp/pabs-tv-client.log
 PABS_MPV_LOGFILE=/tmp/mpv.log
 
-# Display (ajustar según tu entorno)
+# ===== Display (ajustar según tu entorno) =====
 DISPLAY=:0
+# Si tu sesión es Wayland, descomenta:
 # XDG_SESSION_TYPE=wayland
 # WAYLAND_DISPLAY=wayland-0
 
-# MPV (vacío = dejar que mpv decida / use mpv.conf)
+# ===== MPV =====
+# Vacío = no forzar (mpv decide / usa mpv.conf si existe)
 # PABS_MPV_VO=x11
 # PABS_MPV_GPU_CONTEXT=x11
 PABS_MPV_HWDEC=no
@@ -191,14 +195,22 @@ Wants=network-online.target
 Type=simple
 User=${SERVICE_USER}
 WorkingDirectory=${INSTALL_DIR}
-EnvironmentFile=${ENV_FILE}
+
+EnvironmentFile=-${ENV_FILE}
+
 Environment="PATH=${INSTALL_DIR}/env/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="HOME=${SERVICE_HOME}"
 Environment="XDG_CONFIG_HOME=${SERVICE_HOME}/.config"
 Environment="XDG_RUNTIME_DIR=/run/user/%U"
+
+Environment="DISPLAY=:0"
+Environment="XDG_SESSION_TYPE=wayland"
+Environment="WAYLAND_DISPLAY=wayland-0"
+
 ExecStart=${INSTALL_DIR}/env/bin/python3 ${INSTALL_DIR}/pabs-tv-client2.py
-Restart=on-failure
-RestartSec=5
+
+Restart=always
+RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
@@ -210,6 +222,13 @@ EOF
   sudo systemctl enable pabs-tv.service
   print_success "Servicio habilitado"
 
+  echo ""
+  echo "NOTA:"
+  echo "- Si tu Raspberry NO usa Wayland, edita el servicio y comenta:"
+  echo "  XDG_SESSION_TYPE y WAYLAND_DISPLAY (deja DISPLAY=:0)"
+  echo "  sudo nano ${SERVICE_FILE}"
+  echo ""
+
   read -r -p "¿Iniciar el servicio ahora? (s/n) " -n 1 REPLY
   echo ""
   if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
@@ -220,6 +239,7 @@ EOF
     else
       print_error "El servicio no inició"
       print_info "Logs: journalctl -u pabs-tv.service -n 150 --no-pager"
+      print_info "Status: sudo systemctl status pabs-tv.service"
     fi
   fi
 else
@@ -231,6 +251,7 @@ echo ""
 echo "Siguientes pasos:"
 echo "1) Edita .env: nano ${ENV_FILE}"
 echo "2) Edita playlist: nano ${INSTALL_DIR}/playlist.json"
-echo "3) Logs: journalctl -u pabs-tv.service -f"
+echo "3) Reiniciar servicio: sudo systemctl restart pabs-tv.service"
+echo "4) Logs: journalctl -u pabs-tv.service -f"
 echo ""
 print_success "Listo"
