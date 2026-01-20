@@ -183,7 +183,7 @@ PACKAGES=(
   curl
   wget
   x11-xserver-utils
-  flock
+  util-linux
 )
 sudo apt install -y "${PACKAGES[@]}"
 print_success "Paquetes base instalados"
