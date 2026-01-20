@@ -20,8 +20,6 @@ ENV/
 .ruff_cache/
 
 # ---- Environment files (NO subir secretos) ----
-.env
-.env.*
 *.env.backup*
 
 # ---- Editor / OS ----
