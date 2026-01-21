@@ -524,7 +524,8 @@ mkdir -p "${LOCAL_MEDIA_DIR}/videos" "${LOCAL_MEDIA_DIR}/images"
 
 log "==== Sync END ===="
 log "Local totals:"
-find "${LOCAL_MEDIA_DIR}" -type f | wc -l | xargs -I{} log "  files: {}"
+count="$(find "${LOCAL_MEDIA_DIR}" -type f | wc -l)"
+log "  files: ${count}"
 log ""
 EOF
 
