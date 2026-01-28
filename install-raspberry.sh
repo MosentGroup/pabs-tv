@@ -61,6 +61,7 @@ ask() {
 
 ask_confirmed() {
   # ask_confirmed "prompt" "default" -> stdout value (typed twice)
+  # IMPORTANTE: aquí TODO lo informativo va a STDERR para no “ensuciar” el valor capturado.
   local prompt="$1"
   local def="$2"
 
@@ -69,20 +70,25 @@ ask_confirmed() {
     a="$(ask "${prompt} (1/2)" "${def}")"
     b="$(ask "${prompt} (2/2)" "${def}")"
 
+    # limpiar CR por si copian/pegan desde Windows
+    a="${a//$'\r'/}"
+    b="${b//$'\r'/}"
+
     if [ "$a" != "$b" ]; then
-      print_warning "No coincide. Vuelve a escribirlo (debe ser idéntico)."
+      print_warning "No coincide. Vuelve a escribirlo (debe ser idéntico)." >&2
       continue
     fi
 
-    echo ""
-    print_info "Valor capturado: ${a}"
+    echo "" >&2
+    print_info "Valor capturado: ${a}" >&2
     read -r -p "¿Está correcto? (s/n) " -n 1 REPLY
-    echo ""
+    echo "" >&2
     if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
-      echo "$a"
+      # SOLO el valor final a STDOUT (esto es lo que se guarda en la variable)
+      printf '%s\n' "$a"
       return 0
     fi
-    print_info "Ok, vuelve a capturarlo."
+    print_info "Ok, vuelve a capturarlo." >&2
   done
 }
 
@@ -173,7 +179,7 @@ if [[ ! "${REPLY}" =~ ^[Ss]$ ]]; then
 fi
 
 echo ""
-# CLIENT ID con doble confirmación
+# CLIENT ID con doble confirmación (YA NO ENSUCIA EL .env)
 PABS_CLIENT_ID="$(ask_confirmed "PABS_CLIENT_ID" "${DEFAULT_CLIENT_ID}")"
 
 # Valores fijos (hardcodeados)
