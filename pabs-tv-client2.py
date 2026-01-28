@@ -154,14 +154,13 @@ MPV_IPC_PATH = Path(_env_get(
 ))
 
 # mpv persistente: se queda abierto y solo cambiamos contenido por IPC
+# FIX: quitamos --keep-open=yes porque rompe el wait por idle.
 MPV_BASE_OPTS = [
     MPV,
     "--fs",
     "--no-osc",
     "--no-osd-bar",
     "--idle=yes",
-    "--keep-open=yes",
-    "--force-window=yes",
     "--volume=100",
     "--volume-max=100",
     f"--log-file={MPV_LOG}",
@@ -170,6 +169,12 @@ MPV_BASE_OPTS = [
     f"--input-ipc-server={str(MPV_IPC_PATH)}",
 ]
 
+# force-window solo si NO es DRM
+if MPV_VO and MPV_VO.lower() == "drm":
+    pass
+else:
+    MPV_BASE_OPTS.append("--force-window=yes")
+
 if MPV_VO:
     MPV_BASE_OPTS.append(f"--vo={MPV_VO}")
 if MPV_GPU_CONTEXT:
@@ -177,7 +182,6 @@ if MPV_GPU_CONTEXT:
 if MPV_EXTRA_OPTS_RAW:
     MPV_BASE_OPTS.extend(MPV_EXTRA_OPTS_RAW.split())
 
-YTDL_OPTS = ["--ytdl"]
 YTDL_FORMAT_TRIES = [
     "bestvideo[height<=720]+bestaudio/best/best",
     "bestvideo[height<=1080]+bestaudio/best/best",
@@ -220,6 +224,7 @@ schedule_change_event = threading.Event()
 
 mpv_proc = None
 mpv_lock = threading.Lock()
+mpv_ipc_lock = threading.Lock()
 
 mqtt_connected_evt = threading.Event()
 
@@ -262,17 +267,18 @@ def publish_status_snapshot(mqttc, event="status"):
 # ----------------------------
 # MPV IPC
 # ----------------------------
-def _mpv_ipc_send(cmd_obj: dict, timeout=0.4):
+def _mpv_ipc_send(cmd_obj: dict, timeout=1.0):
     import socket as pysocket
     if not MPV_IPC_PATH.exists():
         return None, "ipc_socket_missing"
-    s = pysocket.socket(pysocket.AF_UNIX, pysocket.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        s.connect(str(MPV_IPC_PATH))
-        msg = (json.dumps(cmd_obj) + "\n").encode("utf-8")
-        s.sendall(msg)
+
+    with mpv_ipc_lock:
+        s = pysocket.socket(pysocket.AF_UNIX, pysocket.SOCK_STREAM)
+        s.settimeout(timeout)
         try:
+            s.connect(str(MPV_IPC_PATH))
+            msg = (json.dumps(cmd_obj) + "\n").encode("utf-8")
+            s.sendall(msg)
             data = s.recv(65535)
             if not data:
                 return None, "no_response"
@@ -280,34 +286,33 @@ def _mpv_ipc_send(cmd_obj: dict, timeout=0.4):
                 return json.loads(data.decode("utf-8", errors="ignore")), None
             except Exception:
                 return None, "bad_response"
-        except Exception:
-            return None, "recv_error"
-    except Exception as e:
-        return None, str(e)
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+        except Exception as e:
+            return None, str(e)
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 def _mpv_get_property(prop: str):
-    resp, err = _mpv_ipc_send({"command": ["get_property", prop]})
+    resp, err = _mpv_ipc_send({"command": ["get_property", prop]}, timeout=0.6)
     if err is not None or not isinstance(resp, dict):
         return None
     return resp.get("data")
 
 def _mpv_set_property(prop: str, value):
-    resp, err = _mpv_ipc_send({"command": ["set_property", prop, value]})
+    resp, err = _mpv_ipc_send({"command": ["set_property", prop, value]}, timeout=1.0)
     return err is None
 
 def mpv_set_pause(paused: bool) -> bool:
     with mpv_lock:
         global mpv_proc
-        resp, err = _mpv_ipc_send({"command": ["set_property", "pause", bool(paused)]})
+        resp, err = _mpv_ipc_send({"command": ["set_property", "pause", bool(paused)]}, timeout=1.0)
         if err is None:
             set_state(paused=bool(paused))
             return True
 
+        # fallback SIGSTOP/SIGCONT si IPC falla
         if mpv_proc is not None:
             try:
                 if paused:
@@ -326,7 +331,7 @@ def mpv_toggle_pause() -> bool:
     return mpv_set_pause(target)
 
 def mpv_quit() -> bool:
-    resp, err = _mpv_ipc_send({"command": ["quit"]})
+    resp, err = _mpv_ipc_send({"command": ["quit"]}, timeout=1.0)
     if err is None:
         return True
     with mpv_lock:
@@ -340,7 +345,7 @@ def mpv_quit() -> bool:
     return False
 
 def _mpv_stop_playback():
-    _mpv_ipc_send({"command": ["stop"]})
+    _mpv_ipc_send({"command": ["stop"]}, timeout=1.0)
 
 def _ensure_mpv_running():
     global mpv_proc
@@ -350,7 +355,6 @@ def _ensure_mpv_running():
                 return True
             mpv_proc = None
 
-        # limpiar socket viejo antes de arrancar
         try:
             if MPV_IPC_PATH.exists():
                 MPV_IPC_PATH.unlink()
@@ -365,11 +369,9 @@ def _ensure_mpv_running():
             mpv_proc = None
             return False
 
-    # esperar socket
     t0 = time.time()
-    while time.time() - t0 < 2.0:
+    while time.time() - t0 < 3.0:
         if MPV_IPC_PATH.exists():
-            # aplicar volumen por si acaso
             _mpv_set_property("volume", 100)
             _mpv_set_property("mute", False)
             return True
@@ -382,16 +384,14 @@ def _mpv_loadfile(src: str, start_at=None):
     if not _ensure_mpv_running():
         return False
 
-    # Garantizar volumen alto siempre
     _mpv_set_property("volume", 100)
     _mpv_set_property("mute", False)
     _mpv_set_property("pause", False)
 
-    # start= (para videos/urls)
     if start_at:
-        resp, err = _mpv_ipc_send({"command": ["loadfile", src, "replace", f"start={start_at}"]})
+        resp, err = _mpv_ipc_send({"command": ["loadfile", src, "replace", f"start={start_at}"]}, timeout=1.0)
     else:
-        resp, err = _mpv_ipc_send({"command": ["loadfile", src, "replace"]})
+        resp, err = _mpv_ipc_send({"command": ["loadfile", src, "replace"]}, timeout=1.0)
 
     if err is None:
         return True
@@ -399,20 +399,25 @@ def _mpv_loadfile(src: str, start_at=None):
     log.warning("[MPV] loadfile error: %s", err)
     return False
 
-def _wait_until_idle(max_wait=None):
-    # idle-active: True cuando no está reproduciendo nada
-    t0 = time.time()
+def _wait_until_end():
+    """
+    FIX: no dependemos solo de idle-active.
+    Detectamos fin por eof-reached=True.
+    """
     while True:
         if stop_all_event.is_set():
             _mpv_stop_playback()
             return "stopped"
 
+        eof = _mpv_get_property("eof-reached")
+        if eof is True:
+            # dejar mpv idle para siguiente item
+            _mpv_stop_playback()
+            return "eof"
+
         idle = _mpv_get_property("idle-active")
         if idle is True:
             return "idle"
-
-        if max_wait is not None and (time.time() - t0) > max_wait:
-            return "timeout"
 
         time.sleep(0.2)
 
@@ -433,23 +438,30 @@ def build_media_path(src, kind):
     return src
 
 def play_image_persistent(src, duration):
-    # Cargar la imagen y mantenerla en pantalla el tiempo indicado,
-    # sin cerrar mpv (evita “flash” del escritorio).
     ok = _mpv_loadfile(src)
     if not ok:
         return False
 
-    secs = int(duration or 8)
-    t0 = time.time()
-    while (time.time() - t0) < secs:
+    remaining = float(int(duration or 8))
+    last = time.monotonic()
+
+    while remaining > 0:
         if stop_all_event.is_set():
             _mpv_stop_playback()
             return False
-        time.sleep(0.1)
 
-    # detener para quedar idle y pasar al siguiente item
+        st = get_state()
+        now = time.monotonic()
+        dt = now - last
+        last = now
+
+        # FIX: si está pausado, NO descontar tiempo
+        if not st.get("paused", False):
+            remaining -= dt
+
+        time.sleep(0.05)
+
     _mpv_stop_playback()
-    _wait_until_idle(max_wait=2)
     return True
 
 def play_video_persistent(src, start_at=None):
@@ -457,17 +469,16 @@ def play_video_persistent(src, start_at=None):
     if not ok:
         return False
 
-    # esperar a que termine el video (idle-active vuelve True)
-    res = _wait_until_idle(max_wait=None)
-    return res == "idle"
+    res = _wait_until_end()
+    return res in ("eof", "idle")
 
 def play_youtube_persistent(url, start_at=None):
     ok = _mpv_loadfile(url, start_at=start_at)
     if ok:
-        res = _wait_until_idle(max_wait=None)
-        return res == "idle"
+        res = _wait_until_end()
+        return res in ("eof", "idle")
 
-    # fallback igual que antes (yt-dlp)
+    # fallback yt-dlp
     log.warning("[YOUTUBE] mpv directo falló, intentando fallback yt-dlp: %s", url)
     ytdlp = shutil.which("yt-dlp") or shutil.which("youtube-dl")
     if not ytdlp:
@@ -481,33 +492,11 @@ def play_youtube_persistent(url, start_at=None):
             for du in urls:
                 ok2 = _mpv_loadfile(du, start_at=start_at)
                 if ok2:
-                    res = _wait_until_idle(max_wait=None)
-                    if res == "idle":
+                    res = _wait_until_end()
+                    if res in ("eof", "idle"):
                         return True
         except Exception:
             continue
-
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        out_pattern = str(CACHE_DIR / "%(id)s.%(ext)s")
-        dl_cmd = [ytdlp, "-f", "bv*+ba/b", "-o", out_pattern, url]
-        okd = subprocess.call(dl_cmd) == 0
-        if okd:
-            try:
-                vid = subprocess.check_output([ytdlp, "--get-id", url], text=True).strip()
-            except Exception:
-                vid = None
-            if vid:
-                for ext in ("mp4", "mkv", "webm"):
-                    cand = CACHE_DIR / f"{vid}.{ext}"
-                    if cand.exists():
-                        return play_video_persistent(str(cand), start_at=start_at)
-            files = list(CACHE_DIR.glob("*.*"))
-            if files:
-                files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                return play_video_persistent(str(files[0]), start_at=start_at)
-    except Exception as e:
-        log.error("[YOUTUBE] fallback descarga error: %s", e)
 
     return False
 
@@ -669,56 +658,10 @@ def choose_boot_playlist_file() -> Path:
     return LOCAL_PLAYLIST_FILE
 
 # ----------------------------
-# Prefetch YouTube (igual que antes)
-# ----------------------------
-def maybe_prefetch(item, publish_fn=None):
-    if item.get("kind") != "youtube" or not item.get("prefetch"):
-        return item
-    ytdlp = shutil.which("yt-dlp")
-    if not ytdlp:
-        return item
-
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        vid = subprocess.check_output([ytdlp, "--get-id", item["src"]], text=True).strip()
-    except Exception:
-        return item
-
-    for ext in ("mp4", "mkv", "webm"):
-        cand = CACHE_DIR / f"{vid}.{ext}"
-        if cand.exists():
-            new_item = dict(item)
-            new_item["kind"] = "video"
-            new_item["src"] = str(cand)
-            new_item.pop("prefetch", None)
-            return new_item
-
-    out_pattern = str(CACHE_DIR / "%(id)s.%(ext)s")
-    cmd = [ytdlp, "-f", "bv*+ba/b", "-o", out_pattern, item["src"]]
-    if publish_fn:
-        publish_fn({"event": "prefetch.start", "url": item["src"]})
-    ok = subprocess.call(cmd) == 0
-    if not ok:
-        if publish_fn:
-            publish_fn({"event": "prefetch.error", "url": item["src"]})
-        return item
-
-    for ext in ("mp4", "mkv", "webm"):
-        cand = CACHE_DIR / f"{vid}.{ext}"
-        if cand.exists():
-            new_item = dict(item)
-            new_item["kind"] = "video"
-            new_item["src"] = str(cand)
-            new_item.pop("prefetch", None)
-            return new_item
-
-    return item
-
-# ----------------------------
 # Playback handlers
 # ----------------------------
 def handle_item_play(item, retries, publish_fn=None, show_time=False):
-    it = maybe_prefetch(item, publish_fn=publish_fn)
+    it = item
     kind = it.get("kind")
     src = it.get("src")
     dur = it.get("duration")
@@ -762,10 +705,7 @@ def handle_item_play(item, retries, publish_fn=None, show_time=False):
 # Threads
 # ----------------------------
 def loop_thread_fn(mqttc):
-    last_mtime = None
     tv_state_on = False
-
-    # asegurar mpv desde el inicio para evitar flashes
     _ensure_mpv_running()
 
     while True:
@@ -774,26 +714,13 @@ def loop_thread_fn(mqttc):
         schedule_change_event.clear()
 
         st = get_state()
-        playlist = st.get("loop_playlist")
-        path_str = st.get("loop_playlist_file")
-
-        if not path_str and playlist is None:
-            path_str = str(choose_boot_playlist_file())
-            set_state(loop_playlist_file=path_str)
+        path_str = st.get("loop_playlist_file") or str(choose_boot_playlist_file())
 
         try:
-            if playlist is None and path_str:
-                path = Path(path_str).expanduser()
-                if not path.is_absolute():
-                    path = (PROJECT_DIR / path).resolve()
-                playlist = load_playlist_from_file(path)
-                try:
-                    last_mtime = path.stat().st_mtime
-                except Exception:
-                    last_mtime = None
-            else:
-                playlist = normalize_playlist(playlist or {})
-                path = None
+            path = Path(path_str).expanduser()
+            if not path.is_absolute():
+                path = (PROJECT_DIR / path).resolve()
+            playlist = load_playlist_from_file(path)
         except Exception as e:
             set_state(last_error=str(e))
             publish(mqttc, TOPIC_STATUS, {"event": "error", "error": str(e)}, retain=True)
@@ -854,68 +781,18 @@ def loop_thread_fn(mqttc):
                 break
 
             if black_between > 0 and loop_should_run.is_set():
-                # sin “home”: mpv sigue abierto, solo hacemos pausa antes del siguiente item
-                t0 = time.time()
-                while (time.time() - t0) < black_between:
+                remaining = float(black_between)
+                last = time.monotonic()
+                while remaining > 0:
                     if stop_all_event.is_set():
                         break
-                    time.sleep(0.1)
-
-        try:
-            if path is not None and path.exists():
-                mtime = path.stat().st_mtime
-                if last_mtime and mtime != last_mtime:
-                    publish(mqttc, TOPIC_STATUS, {"event": "playlist.reload"}, retain=False)
-                    last_mtime = mtime
-        except Exception:
-            pass
-
-def scheduler_thread_fn(mqttc):
-    last_check_minute = None
-    while True:
-        time.sleep(10)
-        now = datetime.now()
-        current_minute = (now.hour, now.minute)
-        if current_minute == last_check_minute:
-            continue
-        last_check_minute = current_minute
-
-        st = get_state()
-        scheduled_playlists = st.get("scheduled_playlists", [])
-        if not scheduled_playlists:
-            continue
-
-        for sched in scheduled_playlists:
-            start_time_str = sched.get("start_time")
-            playlist_data = sched.get("playlist")
-            playlist_name = sched.get("name", "unnamed")
-            if not start_time_str or not playlist_data:
-                continue
-            start_t = parse_time_str(start_time_str)
-            if not start_t:
-                continue
-            if start_t.hour == now.time().hour and start_t.minute == now.time().minute:
-                stop_all_event.set()
-                loop_should_run.clear()
-                time.sleep(0.5)
-                stop_all_event.clear()
-                schedule_change_event.clear()
-
-                playlist_data = normalize_playlist(playlist_data)
-                set_state(loop_playlist=playlist_data, loop_playlist_file=None, active_scheduled_playlist=playlist_name)
-                loop_should_run.set()
-                publish(
-                    mqttc,
-                    TOPIC_STATUS,
-                    {
-                        "event": "scheduler.playlist_activated",
-                        "playlist_name": playlist_name,
-                        "start_time": start_time_str,
-                        "activated_at": now.strftime("%H:%M:%S"),
-                        "items_count": len(playlist_data.get("items", [])),
-                    },
-                    retain=False,
-                )
+                    st2 = get_state()
+                    now = time.monotonic()
+                    dt = now - last
+                    last = now
+                    if not st2.get("paused", False):
+                        remaining -= dt
+                    time.sleep(0.05)
 
 def direct_thread_fn(mqttc):
     while True:
@@ -998,8 +875,6 @@ def main():
         sys.exit(1)
 
     _install_lockfile()
-
-    # Arrancar mpv persistente desde el inicio (evita “home flash” entre items)
     _ensure_mpv_running()
 
     try:
@@ -1054,7 +929,8 @@ def main():
         action_l = action.lower().strip()
 
         pause_actions = {"pause", "play.pause", "player.pause", "video.pause"}
-        resume_actions = {"resume", "play.resume", "play.play", "player.play", "video.resume"}
+        # FIX: agregamos "play" y "unpause"
+        resume_actions = {"resume", "play", "unpause", "play.resume", "play.play", "player.play", "video.resume"}
         toggle_actions = {"toggle", "toggle_pause", "pause.toggle", "play.toggle_pause", "play.pause_toggle"}
 
         if action_l in pause_actions:
@@ -1097,19 +973,15 @@ def main():
             if playlist:
                 playlist = normalize_playlist(playlist)
                 persist_remote_playlist(playlist)
-                set_state(loop_playlist=None, loop_playlist_file=str(REMOTE_PLAYLIST_FILE))
+                set_state(loop_playlist_file=str(REMOTE_PLAYLIST_FILE))
             else:
                 if playlist_file:
                     pf = Path(str(playlist_file)).expanduser()
                     if not pf.is_absolute():
                         pf = (PROJECT_DIR / pf).resolve()
-                    set_state(loop_playlist=None, loop_playlist_file=str(pf))
+                    set_state(loop_playlist_file=str(pf))
                 else:
-                    st = get_state()
-                    if not st.get("loop_playlist_file"):
-                        set_state(loop_playlist=None, loop_playlist_file=str(choose_boot_playlist_file()))
-                    else:
-                        set_state(loop_playlist=None)
+                    set_state(loop_playlist_file=str(choose_boot_playlist_file()))
 
             schedule_change_event.set()
             stop_all_event.clear()
@@ -1126,92 +998,6 @@ def main():
             set_state(loop_running=False, current_src="ninguno", paused=False)
             publish(client, TOPIC_STATUS, {"event": "loop.stopped", "src": "ninguno"}, retain=False)
             publish_status_snapshot(client, event="status")
-            return
-
-        if action_l == "loop.reload":
-            schedule_change_event.set()
-            stop_all_event.set()
-            time.sleep(0.1)
-            stop_all_event.clear()
-            publish(client, TOPIC_STATUS, {"event": "loop.reload.requested"}, retain=False)
-            return
-
-        if action_l == "loop.set_black_between":
-            secs = int(data.get("seconds", 0))
-            set_state(loop_black_between=secs)
-            publish(client, TOPIC_STATUS, {"event": "loop.black_between.set", "seconds": secs}, retain=False)
-            return
-
-        if action_l == "loop.shuffle":
-            enabled = bool(data.get("enabled", False))
-            set_state(loop_shuffle=enabled)
-            publish(client, TOPIC_STATUS, {"event": "loop.shuffle.set", "enabled": enabled}, retain=False)
-            return
-
-        if action_l == "loop.show_time":
-            enabled = bool(data.get("enabled", False))
-            set_state(show_time=enabled)
-            publish(client, TOPIC_STATUS, {"event": "loop.show_time.set", "enabled": enabled}, retain=False)
-            return
-
-        if action_l == "loop.schedule":
-            enabled = bool(data.get("enabled", False))
-            start_time = data.get("start_time")
-            end_time = data.get("end_time")
-            set_state(schedule_enabled=enabled, schedule_start=start_time, schedule_end=end_time)
-            publish(client, TOPIC_STATUS, {"event": "loop.schedule.set", "enabled": enabled, "start_time": start_time, "end_time": end_time}, retain=False)
-            return
-
-        if action_l == "scheduler.add":
-            playlist_name = data.get("name")
-            start_time = data.get("start_time")
-            playlist_data = data.get("playlist")
-
-            if not playlist_name or not start_time or not playlist_data:
-                publish(client, TOPIC_STATUS, {"event": "scheduler.add.error", "error": "missing name/start_time/playlist"}, retain=False)
-                return
-
-            if not parse_time_str(start_time):
-                publish(client, TOPIC_STATUS, {"event": "scheduler.add.error", "error": "invalid start_time (HH:MM)"}, retain=False)
-                return
-
-            playlist_data = normalize_playlist(playlist_data)
-            if not playlist_data.get("items"):
-                publish(client, TOPIC_STATUS, {"event": "scheduler.add.error", "error": "playlist must include items"}, retain=False)
-                return
-
-            st = get_state()
-            scheduled = st.get("scheduled_playlists", [])
-            if any(s.get("name") == playlist_name and s.get("start_time") == start_time for s in scheduled):
-                publish(client, TOPIC_STATUS, {"event": "scheduler.add.warning", "message": "already exists"}, retain=False)
-                return
-
-            scheduled.append({"name": playlist_name, "start_time": start_time, "playlist": playlist_data})
-            set_state(scheduled_playlists=scheduled)
-            publish(client, TOPIC_STATUS, {"event": "scheduler.add.success", "name": playlist_name, "start_time": start_time, "total": len(scheduled)}, retain=False)
-            return
-
-        if action_l == "scheduler.remove":
-            playlist_name = data.get("name")
-            if not playlist_name:
-                publish(client, TOPIC_STATUS, {"event": "scheduler.remove.error", "error": "missing name"}, retain=False)
-                return
-            st = get_state()
-            scheduled = st.get("scheduled_playlists", [])
-            new_scheduled = [s for s in scheduled if s.get("name") != playlist_name]
-            set_state(scheduled_playlists=new_scheduled)
-            publish(client, TOPIC_STATUS, {"event": "scheduler.remove.success", "name": playlist_name, "total": len(new_scheduled)}, retain=False)
-            return
-
-        if action_l == "scheduler.list":
-            st = get_state()
-            publish(client, TOPIC_STATUS, {"event": "scheduler.list", "scheduled_playlists": st.get("scheduled_playlists", []), "total": len(st.get("scheduled_playlists", [])), "active": st.get("active_scheduled_playlist")}, retain=False)
-            return
-
-        if action_l == "tv.power":
-            state_tv = (data.get("state") or "").lower()
-            ok, detail = tv_power_control(state_tv)
-            publish(client, TOPIC_STATUS, {"event": "tv.power", "state": state_tv, "ok": bool(ok), "detail": detail}, retain=False)
             return
 
         if action_l == "play.once":
@@ -1237,12 +1023,10 @@ def main():
             publish(client, TOPIC_STATUS, {"event": "direct.enqueued"}, retain=False)
             return
 
-        if action_l == "play.stop":
-            stop_all_event.set()
-            _mpv_stop_playback()
-            set_state(current_item=None, current_src="ninguno", paused=False)
-            publish(client, TOPIC_STATUS, {"event": "play.stopped", "src": "ninguno"}, retain=False)
-            publish_status_snapshot(client, event="status")
+        if action_l == "tv.power":
+            state_tv = (data.get("state") or "").lower()
+            ok, detail = tv_power_control(state_tv)
+            publish(client, TOPIC_STATUS, {"event": "tv.power", "state": state_tv, "ok": bool(ok), "detail": detail}, retain=False)
             return
 
         publish(client, TOPIC_STATUS, {"event": "error", "error": f"unknown action: {action}"}, retain=False)
@@ -1255,11 +1039,9 @@ def main():
 
     threading.Thread(target=lambda: loop_thread_fn(mqttc), daemon=True).start()
     threading.Thread(target=lambda: direct_thread_fn(mqttc), daemon=True).start()
-    threading.Thread(target=lambda: scheduler_thread_fn(mqttc), daemon=True).start()
     threading.Thread(target=lambda: heartbeat_thread_fn(mqttc), daemon=True).start()
 
-    boot_file = choose_boot_playlist_file()
-    set_state(loop_playlist=None, loop_playlist_file=str(boot_file))
+    set_state(loop_playlist_file=str(choose_boot_playlist_file()))
     loop_should_run.set()
 
     log.info("Iniciando MQTT (connect_async) hacia %s:%s ...", MQTT_HOST, MQTT_PORT)
