@@ -40,7 +40,6 @@ env_get() {
   local key="$1"
   local file="$2"
   if [ -f "$file" ]; then
-    # soporta KEY=value o KEY="value"
     local line
     line="$(grep -E "^[[:space:]]*${key}=" "$file" | tail -n 1 || true)"
     if [ -n "$line" ]; then
@@ -60,24 +59,47 @@ ask() {
   echo "${out:-$def}"
 }
 
-ask_secret() {
-  # ask_secret "prompt" "default"
+ask_confirmed() {
+  # ask_confirmed "prompt" "default" -> stdout value (typed twice)
   local prompt="$1"
   local def="$2"
-  local out
-  echo -n "${prompt} [${def:+(Enter para conservar)}]: "
-  read -r -s out
-  echo ""
-  if [ -z "$out" ]; then
-    echo "$def"
-  else
-    echo "$out"
-  fi
+
+  while true; do
+    local a b
+    a="$(ask "${prompt} (1/2)" "${def}")"
+    b="$(ask "${prompt} (2/2)" "${def}")"
+
+    if [ "$a" != "$b" ]; then
+      print_warning "No coincide. Vuelve a escribirlo (debe ser idéntico)."
+      continue
+    fi
+
+    echo ""
+    print_info "Valor capturado: ${a}"
+    read -r -p "¿Está correcto? (s/n) " -n 1 REPLY
+    echo ""
+    if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
+      echo "$a"
+      return 0
+    fi
+    print_info "Ok, vuelve a capturarlo."
+  done
 }
+
+# ===========================
+# OBLIGAR chmod +x
+# ===========================
+if [ ! -x "$0" ]; then
+  echo -e "${RED}✗ Este instalador debe ejecutarse con permisos de ejecución.${NC}"
+  echo -e "${BLUE}ℹ Corre esto y vuelve a intentarlo:${NC}"
+  echo -e "  chmod +x ./install-raspberry.sh"
+  echo -e "  ./install-raspberry.sh"
+  exit 1
+fi
 
 if [ "${EUID}" -eq 0 ]; then
   print_error "No ejecutes este script como root."
-  print_info "Ejecuta: bash install-raspberry.sh"
+  print_info "Ejecuta: ./install-raspberry.sh"
   exit 1
 fi
 
@@ -111,20 +133,8 @@ HOSTNAME_SHORT="$(hostname | tr -d '[:space:]')"
 DEFAULT_CLIENT_ID="$(env_get PABS_CLIENT_ID "${ENV_FILE}" || true)"
 DEFAULT_CLIENT_ID="${DEFAULT_CLIENT_ID:-pabstv-${HOSTNAME_SHORT}}"
 
-DEFAULT_MQTT_HOST="$(env_get PABS_MQTT_HOST "${ENV_FILE}" || true)"
-DEFAULT_MQTT_HOST="${DEFAULT_MQTT_HOST:-localhost}"
-
-DEFAULT_MQTT_PORT="$(env_get PABS_MQTT_PORT "${ENV_FILE}" || true)"
-DEFAULT_MQTT_PORT="${DEFAULT_MQTT_PORT:-1883}"
-
 DEFAULT_TOPIC_BASE="$(env_get PABS_TOPIC_BASE "${ENV_FILE}" || true)"
 DEFAULT_TOPIC_BASE="${DEFAULT_TOPIC_BASE:-pabs-tv}"
-
-DEFAULT_MQTT_USER="$(env_get PABS_MQTT_USER "${ENV_FILE}" || true)"
-DEFAULT_MQTT_USER="${DEFAULT_MQTT_USER:-pabs_admin}"
-
-DEFAULT_MQTT_PASS="$(env_get PABS_MQTT_PASS "${ENV_FILE}" || true)"
-DEFAULT_MQTT_PASS="${DEFAULT_MQTT_PASS:-}"
 
 # Defaults Nextcloud sync
 DEFAULT_SYNC_ENABLE="$(env_get PABS_SYNC_ENABLE "${ENV_FILE}" || true)"
@@ -132,9 +142,6 @@ DEFAULT_SYNC_ENABLE="${DEFAULT_SYNC_ENABLE:-0}"
 
 DEFAULT_RCLONE_REMOTE_NAME="$(env_get PABS_RCLONE_REMOTE_NAME "${ENV_FILE}" || true)"
 DEFAULT_RCLONE_REMOTE_NAME="${DEFAULT_RCLONE_REMOTE_NAME:-nextcloud}"
-
-DEFAULT_RCLONE_REMOTE_PATH="$(env_get PABS_RCLONE_REMOTE_PATH "${ENV_FILE}" || true)"
-DEFAULT_RCLONE_REMOTE_PATH="${DEFAULT_RCLONE_REMOTE_PATH:-pabs-tv/media}"
 
 # ==========================================================
 # MQTT FIJO (NO PREGUNTAR / SIEMPRE ESTOS VALORES)
@@ -144,6 +151,11 @@ FIXED_MQTT_HOST="3.18.167.209"
 FIXED_MQTT_PORT="1883"
 FIXED_MQTT_USER="pabs_admin"
 FIXED_MQTT_PASS='58490Ged$$kgd-op3EdEB'
+
+# ==========================================================
+# Nextcloud remote path FIJO (NO PREGUNTAR)
+# ==========================================================
+FIXED_RCLONE_REMOTE_PATH="pabs-tv/media"
 
 clear
 print_header "INSTALADOR DE PABS-TV (con Nextcloud sync integrado)"
@@ -161,7 +173,8 @@ if [[ ! "${REPLY}" =~ ^[Ss]$ ]]; then
 fi
 
 echo ""
-PABS_CLIENT_ID="$(ask "PABS_CLIENT_ID" "${DEFAULT_CLIENT_ID}")"
+# CLIENT ID con doble confirmación
+PABS_CLIENT_ID="$(ask_confirmed "PABS_CLIENT_ID" "${DEFAULT_CLIENT_ID}")"
 
 # Valores fijos (hardcodeados)
 PABS_MQTT_HOST="${FIXED_MQTT_HOST}"
@@ -204,9 +217,31 @@ PACKAGES=(
   wget
   x11-xserver-utils
   util-linux
+  alsa-utils
 )
 sudo apt install -y "${PACKAGES[@]}"
 print_success "Paquetes base instalados"
+
+print_header "PASO 2.1: Permisos de audio/video (recomendado)"
+# ayuda para HDMI audio/video, DRM, etc.
+sudo usermod -aG video,render,audio,input "${SERVICE_USER}" || true
+print_success "Usuario agregado a grupos: video, render, audio, input (si aplica)"
+
+print_header "PASO 2.2: Ajuste de pantalla (quitar overscan / barras negras)"
+BOOT_CFG="/boot/firmware/config.txt"
+if [ -f "${BOOT_CFG}" ]; then
+  backup_file "${BOOT_CFG}"
+  if grep -qE '^[[:space:]]*disable_overscan=' "${BOOT_CFG}"; then
+    sudo sed -i -E 's/^[[:space:]]*disable_overscan=.*/disable_overscan=1/' "${BOOT_CFG}"
+  else
+    echo "" | sudo tee -a "${BOOT_CFG}" >/dev/null
+    echo "disable_overscan=1" | sudo tee -a "${BOOT_CFG}" >/dev/null
+  fi
+  print_success "Configurado: disable_overscan=1 en ${BOOT_CFG}"
+  print_info "Nota: si ya estaba ok, no cambia nada. Este ajuste suele quitar franjas por escalado."
+else
+  print_warning "No existe ${BOOT_CFG}. Saltando ajuste overscan."
+fi
 
 # Si MQTT es localhost, ofrecer broker mosquitto
 if [[ "${PABS_MQTT_HOST}" == "localhost" || "${PABS_MQTT_HOST}" == "127.0.0.1" ]]; then
@@ -316,10 +351,34 @@ fi
 
 print_info "Resumen MPV: PABS_MPV_VO='${MPV_VO}'  PABS_MPV_GPU_CONTEXT='${MPV_GPU_CONTEXT}'"
 
+print_header "PASO 5.1: Script para volumen al 100% (sistema)"
+VOLUME_SCRIPT="/usr/local/bin/pabs-tv-set-volume.sh"
+sudo tee "${VOLUME_SCRIPT}" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Best-effort: no fallar si alguna herramienta no existe.
+# 1) Pipewire/Wireplumber (Bookworm)
+if command -v wpctl >/dev/null 2>&1; then
+  wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 >/dev/null 2>&1 || true
+  wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0 >/dev/null 2>&1 || true
+fi
+
+# 2) ALSA fallback
+if command -v amixer >/dev/null 2>&1; then
+  amixer -q sset Master 100% unmute >/dev/null 2>&1 || true
+  amixer -q sset PCM 100% unmute >/dev/null 2>&1 || true
+  amixer -q sset HDMI 100% unmute >/dev/null 2>&1 || true
+fi
+
+exit 0
+EOF
+sudo chmod +x "${VOLUME_SCRIPT}"
+print_success "Script de volumen creado: ${VOLUME_SCRIPT}"
+
 print_header "PASO 6: Escribiendo .env (se sobrescribe)"
 backup_file "${ENV_FILE}"
 
-# Escribimos valores entre comillas para evitar problemas con $ y espacios
 cat > "${ENV_FILE}" <<EOF
 # Identificación
 PABS_CLIENT_ID="${PABS_CLIENT_ID}"
@@ -367,7 +426,7 @@ PABS_MPV_EXTRA_OPTS=""
 # Nextcloud / rclone sync (si habilitas)
 PABS_SYNC_ENABLE="0"
 PABS_RCLONE_REMOTE_NAME="nextcloud"
-PABS_RCLONE_REMOTE_PATH="pabs-tv/media"
+PABS_RCLONE_REMOTE_PATH="${FIXED_RCLONE_REMOTE_PATH}"
 EOF
 
 print_success ".env escrito: ${ENV_FILE}"
@@ -394,6 +453,7 @@ fi
 print_header "PASO 6.1: Nextcloud Sync (integrado) - opcional"
 echo ""
 print_info "Si habilitas esto, se sincroniza ${INSTALL_DIR}/media cada 30 min con rclone."
+print_info "Remote path fijo: ${FIXED_RCLONE_REMOTE_PATH} (ya no pregunta)."
 print_info "Regla: si rclone ya tiene el remote 'nextcloud:', se salta la configuración."
 echo ""
 read -r -p "¿Habilitar sync automático con Nextcloud (rclone) cada 30 min? (s/n) " -n 1 REPLY
@@ -438,10 +498,9 @@ if [[ "${REPLY}" =~ ^[Ss]$ ]]; then
   fi
 
   if [ "${SYNC_ENABLED}" = "1" ]; then
-    RCLONE_REMOTE_PATH="$(ask "Ruta remota dentro de nextcloud (REMOTE_PATH)" "${DEFAULT_RCLONE_REMOTE_PATH}")"
+    RCLONE_REMOTE_PATH="${FIXED_RCLONE_REMOTE_PATH}"
+
     # guardar en .env (sin romper otras vars)
-    # Reescribimos solo estas 3 claves de sync al final del archivo
-    # (simple: remover líneas previas y agregar nuevas)
     tmp_env="${ENV_FILE}.tmp.$$"
     grep -vE '^(PABS_SYNC_ENABLE|PABS_RCLONE_REMOTE_NAME|PABS_RCLONE_REMOTE_PATH)=' "${ENV_FILE}" > "${tmp_env}"
     cat >> "${tmp_env}" <<EOF
@@ -451,20 +510,13 @@ PABS_RCLONE_REMOTE_NAME="nextcloud"
 PABS_RCLONE_REMOTE_PATH="${RCLONE_REMOTE_PATH}"
 EOF
     mv "${tmp_env}" "${ENV_FILE}"
-    print_success ".env actualizado con sync Nextcloud"
+    print_success ".env actualizado con sync Nextcloud (ruta fija)"
 
-    # Crear script sync (basado en tu sync-nextcloud.sh pero usando PABS_* del EnvironmentFile)
+    # Crear script sync
     SYNC_SCRIPT="${INSTALL_DIR}/scripts/sync-nextcloud.sh"
     cat > "${SYNC_SCRIPT}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
-# Lee variables desde systemd EnvironmentFile (.env) porque el service lo carga.
-# Variables esperadas:
-#   PABS_RCLONE_REMOTE_NAME (default: nextcloud)
-#   PABS_RCLONE_REMOTE_PATH (default: pabs-tv/media)
-#   PABS_PROJECT_DIR (default: /home/.../pabs-tv)
-#   PABS_MEDIA_DIR (default: $PABS_PROJECT_DIR/media)
 
 REMOTE_NAME="${PABS_RCLONE_REMOTE_NAME:-nextcloud}"
 REMOTE_PATH="${PABS_RCLONE_REMOTE_PATH:-pabs-tv/media}"
@@ -488,14 +540,12 @@ log() {
   echo "[${DATE_BIN:+$(${DATE_BIN} '+%Y-%m-%d %H:%M:%S')}] $*" | tee -a "${LOG_FILE}"
 }
 
-# Evitar ejecuciones simultáneas
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
   log "[WARN] Ya hay una sincronización corriendo. Saliendo."
   exit 0
 fi
 
-# Verificar remote
 if ! rclone listremotes | grep -q "^${REMOTE_NAME}:$"; then
   log "[ERROR] Remote '${REMOTE_NAME}:' no configurado en rclone"
   exit 1
@@ -509,7 +559,6 @@ log "Local : ${LOCAL_MEDIA_DIR}"
 
 mkdir -p "${LOCAL_MEDIA_DIR}/videos" "${LOCAL_MEDIA_DIR}/images"
 
-# Sync completo a media/ (incluye videos/ e images/)
 "${RCLONE_BIN}" sync "${REMOTE_FULL}" "${LOCAL_MEDIA_DIR}" \
   --create-empty-src-dirs \
   --transfers 4 \
@@ -523,7 +572,6 @@ mkdir -p "${LOCAL_MEDIA_DIR}/videos" "${LOCAL_MEDIA_DIR}/images"
   --log-file "${LOG_FILE}"
 
 log "==== Sync END ===="
-log "Local totals:"
 count="$(find "${LOCAL_MEDIA_DIR}" -type f | wc -l)"
 log "  files: ${count}"
 log ""
@@ -533,7 +581,6 @@ EOF
     sudo chown "${SERVICE_USER}:${SERVICE_USER}" "${SYNC_SCRIPT}" || true
     print_success "Script de sync creado: ${SYNC_SCRIPT}"
 
-    # systemd timer/service
     print_info "Creando/actualizando service/timer systemd (cada 30 min)..."
     SYNC_SERVICE="/etc/systemd/system/pabs-tv-media-sync.service"
     SYNC_TIMER="/etc/systemd/system/pabs-tv-media-sync.timer"
@@ -606,8 +653,11 @@ EnvironmentFile=${ENV_FILE}
 Environment="PATH=${INSTALL_DIR}/env/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="HOME=${SERVICE_HOME}"
 Environment="XDG_CONFIG_HOME=${SERVICE_HOME}/.config"
-# OJO: /run/user/UID puede no existir si nadie inició sesión. Con VO=drm no importa.
 Environment="XDG_RUNTIME_DIR=/run/user/${SERVICE_UID}"
+
+# Volumen al 100% (sistema) antes de iniciar el cliente
+ExecStartPre=${VOLUME_SCRIPT}
+
 ExecStart=${INSTALL_DIR}/env/bin/python3 ${INSTALL_DIR}/${CLIENT_MAIN}
 Restart=on-failure
 RestartSec=5
@@ -649,3 +699,7 @@ echo "5) Si habilitaste sync:         systemctl status pabs-tv-media-sync.timer"
 echo "                                tail -n 200 ${INSTALL_DIR}/cron-sync.log"
 echo ""
 print_success "Listo"
+
+echo ""
+print_info "IMPORTANTE: El ajuste de overscan puede requerir reiniciar el equipo para verse reflejado."
+print_info "Si acabas de instalar y ves franjas, reinicia la Raspberry: sudo reboot"

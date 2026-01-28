@@ -29,7 +29,6 @@ def _env_get(keys, default=None):
     return default
 
 def _safe_name(s: str) -> str:
-    # para nombres de socket/archivo (sin espacios raros)
     out = []
     for ch in str(s):
         if ch.isalnum() or ch in ("-", "_", ".", "@"):
@@ -97,7 +96,6 @@ MQTT_PASS = _env_get(["PABS_MQTT_PASS", "MQTT_PASSWORD", "MQTT_PASS"], "") or No
 
 TOPIC_BASE = _env_get(["PABS_TOPIC_BASE", "MQTT_TOPIC_BASE"], "pabs-tv").strip().strip("/")
 
-# Permite override total si tu server usa otro topic exacto
 TOPIC_CMD = _env_get(["PABS_TOPIC_CMD"], f"{TOPIC_BASE}/{CLIENT_ID}/cmd")
 TOPIC_STATUS = _env_get(["PABS_TOPIC_STATUS"], f"{TOPIC_BASE}/{CLIENT_ID}/status")
 TOPIC_NOWPLAY = _env_get(["PABS_TOPIC_NOWPLAY"], f"{TOPIC_BASE}/{CLIENT_ID}/now_playing")
@@ -107,7 +105,6 @@ MEDIA_DIR = Path(_env_get(["PABS_MEDIA_DIR", "MEDIA_DIR"], str(PROJECT_DIR / "me
 LOCAL_PLAYLIST_FILE = Path(_env_get(["PABS_PLAYLIST_FILE"], str(PROJECT_DIR / "playlist.json"))).expanduser()
 CACHE_DIR = Path(_env_get(["PABS_CACHE_DIR"], str(PROJECT_DIR / "cache"))).expanduser()
 
-# Aquí se guarda lo último recibido por MQTT (persistencia)
 REMOTE_PLAYLIST_FILE = Path(
     _env_get(["PABS_REMOTE_PLAYLIST_FILE"], str(PROJECT_DIR / "playlist.remote.json"))
 ).expanduser()
@@ -156,12 +153,17 @@ MPV_IPC_PATH = Path(_env_get(
     f"/tmp/pabs-tv-mpv-{_safe_name(CLIENT_ID)}.sock"
 ))
 
+# mpv persistente: se queda abierto y solo cambiamos contenido por IPC
 MPV_BASE_OPTS = [
     MPV,
     "--fs",
     "--no-osc",
     "--no-osd-bar",
-    "--keep-open=no",
+    "--idle=yes",
+    "--keep-open=yes",
+    "--force-window=yes",
+    "--volume=100",
+    "--volume-max=100",
     f"--log-file={MPV_LOG}",
     f"--ytdl-format={MPV_YTDL_FORMAT}",
     f"--hwdec={MPV_HWDEC}",
@@ -193,8 +195,8 @@ MODE_DIRECT = "DIRECT"
 state = {
     "mode": MODE_LOOP,
     "loop_running": False,
-    "loop_playlist": None,                 # playlist dict inline
-    "loop_playlist_file": None,            # path string
+    "loop_playlist": None,
+    "loop_playlist_file": None,
     "loop_black_between": 0,
     "loop_shuffle": False,
     "retries": 0,
@@ -255,14 +257,12 @@ def publish_status_snapshot(mqttc, event="status"):
         "paused": bool(st.get("paused", False)),
         "mqtt_connected": bool(st.get("mqtt_connected", False)),
     }
-    # status retained para que tu server vea el último estado
     publish(mqttc, TOPIC_STATUS, payload, retain=True)
 
 # ----------------------------
-# MPV IPC (pause/resume sin reiniciar)
+# MPV IPC
 # ----------------------------
-def _mpv_ipc_send(cmd_obj: dict, timeout=0.2):
-    # Envia JSON por unix socket de mpv
+def _mpv_ipc_send(cmd_obj: dict, timeout=0.4):
     import socket as pysocket
     if not MPV_IPC_PATH.exists():
         return None, "ipc_socket_missing"
@@ -290,16 +290,24 @@ def _mpv_ipc_send(cmd_obj: dict, timeout=0.2):
         except Exception:
             pass
 
+def _mpv_get_property(prop: str):
+    resp, err = _mpv_ipc_send({"command": ["get_property", prop]})
+    if err is not None or not isinstance(resp, dict):
+        return None
+    return resp.get("data")
+
+def _mpv_set_property(prop: str, value):
+    resp, err = _mpv_ipc_send({"command": ["set_property", prop, value]})
+    return err is None
+
 def mpv_set_pause(paused: bool) -> bool:
     with mpv_lock:
         global mpv_proc
-        # 1) intentar IPC nativo (mejor)
         resp, err = _mpv_ipc_send({"command": ["set_property", "pause", bool(paused)]})
         if err is None:
             set_state(paused=bool(paused))
             return True
 
-        # 2) fallback SIGSTOP/SIGCONT (si IPC no disponible)
         if mpv_proc is not None:
             try:
                 if paused:
@@ -318,11 +326,9 @@ def mpv_toggle_pause() -> bool:
     return mpv_set_pause(target)
 
 def mpv_quit() -> bool:
-    # intenta terminar mpv limpio
     resp, err = _mpv_ipc_send({"command": ["quit"]})
     if err is None:
         return True
-    # fallback
     with mpv_lock:
         global mpv_proc
         if mpv_proc is not None:
@@ -333,101 +339,135 @@ def mpv_quit() -> bool:
                 return False
     return False
 
+def _mpv_stop_playback():
+    _mpv_ipc_send({"command": ["stop"]})
+
+def _ensure_mpv_running():
+    global mpv_proc
+    with mpv_lock:
+        if mpv_proc is not None:
+            if mpv_proc.poll() is None:
+                return True
+            mpv_proc = None
+
+        # limpiar socket viejo antes de arrancar
+        try:
+            if MPV_IPC_PATH.exists():
+                MPV_IPC_PATH.unlink()
+        except Exception:
+            pass
+
+        try:
+            log.info("[MPV] arrancando persistente: %s", " ".join(MPV_BASE_OPTS))
+            mpv_proc = subprocess.Popen(MPV_BASE_OPTS)
+        except Exception as e:
+            log.error("[MPV] no se pudo iniciar mpv: %s", e)
+            mpv_proc = None
+            return False
+
+    # esperar socket
+    t0 = time.time()
+    while time.time() - t0 < 2.0:
+        if MPV_IPC_PATH.exists():
+            # aplicar volumen por si acaso
+            _mpv_set_property("volume", 100)
+            _mpv_set_property("mute", False)
+            return True
+        time.sleep(0.02)
+
+    log.warning("[MPV] mpv inició pero no apareció el socket IPC")
+    return False
+
+def _mpv_loadfile(src: str, start_at=None):
+    if not _ensure_mpv_running():
+        return False
+
+    # Garantizar volumen alto siempre
+    _mpv_set_property("volume", 100)
+    _mpv_set_property("mute", False)
+    _mpv_set_property("pause", False)
+
+    # start= (para videos/urls)
+    if start_at:
+        resp, err = _mpv_ipc_send({"command": ["loadfile", src, "replace", f"start={start_at}"]})
+    else:
+        resp, err = _mpv_ipc_send({"command": ["loadfile", src, "replace"]})
+
+    if err is None:
+        return True
+
+    log.warning("[MPV] loadfile error: %s", err)
+    return False
+
+def _wait_until_idle(max_wait=None):
+    # idle-active: True cuando no está reproduciendo nada
+    t0 = time.time()
+    while True:
+        if stop_all_event.is_set():
+            _mpv_stop_playback()
+            return "stopped"
+
+        idle = _mpv_get_property("idle-active")
+        if idle is True:
+            return "idle"
+
+        if max_wait is not None and (time.time() - t0) > max_wait:
+            return "timeout"
+
+        time.sleep(0.2)
+
 # ----------------------------
 # Media / Playback
 # ----------------------------
 def build_media_path(src, kind):
     if not src:
         return src
-
-    # abs o URL
     if src.startswith("/") or src.startswith("http://") or src.startswith("https://"):
         return src
-
-    # ya trae subruta (ej: media/videos/...)
     if "/" in src or "\\" in src:
         return src
-
-    # solo nombre => autocompleta
     if kind == "video":
         return str(MEDIA_VIDEO_DIR / src)
     if kind == "image":
         return str(MEDIA_IMAGE_DIR / src)
     return src
 
-def run_cmd(cmd):
-    global mpv_proc
-    # limpiar socket viejo antes de arrancar
-    try:
-        if MPV_IPC_PATH.exists():
-            MPV_IPC_PATH.unlink()
-    except Exception:
-        pass
+def play_image_persistent(src, duration):
+    # Cargar la imagen y mantenerla en pantalla el tiempo indicado,
+    # sin cerrar mpv (evita “flash” del escritorio).
+    ok = _mpv_loadfile(src)
+    if not ok:
+        return False
 
-    with mpv_lock:
-        set_state(paused=False)
+    secs = int(duration or 8)
+    t0 = time.time()
+    while (time.time() - t0) < secs:
+        if stop_all_event.is_set():
+            _mpv_stop_playback()
+            return False
+        time.sleep(0.1)
 
-    try:
-        log.info("[MPV] %s", " ".join(cmd))
-        with mpv_lock:
-            mpv_proc = subprocess.Popen(cmd)
+    # detener para quedar idle y pasar al siguiente item
+    _mpv_stop_playback()
+    _wait_until_idle(max_wait=2)
+    return True
 
-        # Esperar un poco para que el socket IPC aparezca (no bloquea duro)
-        t0 = time.time()
-        while time.time() - t0 < 1.0:
-            if MPV_IPC_PATH.exists():
-                break
-            time.sleep(0.02)
+def play_video_persistent(src, start_at=None):
+    ok = _mpv_loadfile(src, start_at=start_at)
+    if not ok:
+        return False
 
-        while True:
-            if stop_all_event.is_set():
-                with mpv_lock:
-                    try:
-                        if mpv_proc is not None:
-                            mpv_proc.terminate()
-                            try:
-                                mpv_proc.wait(timeout=3)
-                            except subprocess.TimeoutExpired:
-                                mpv_proc.kill()
-                    except Exception:
-                        pass
-                return False
+    # esperar a que termine el video (idle-active vuelve True)
+    res = _wait_until_idle(max_wait=None)
+    return res == "idle"
 
-            with mpv_lock:
-                proc = mpv_proc
-            if proc is None:
-                return False
-
-            ret = proc.poll()
-            if ret is not None:
-                return ret == 0
-
-            time.sleep(0.1)
-    finally:
-        with mpv_lock:
-            mpv_proc = None
-        set_state(paused=False)
-
-def play_image(src, duration):
-    cmd = MPV_BASE_OPTS + [f"--image-display-duration={int(duration or 8)}", "--loop-file=no", src]
-    return run_cmd(cmd)
-
-def play_video(src, duration=None, start_at=None):
-    cmd = MPV_BASE_OPTS.copy()
-    if start_at:
-        cmd += [f"--start={start_at}"]
-    cmd += [src]
-    return run_cmd(cmd)
-
-def play_youtube(url, duration=None, start_at=None):
-    cmd = MPV_BASE_OPTS.copy() + YTDL_OPTS
-    if start_at:
-        cmd += [f"--start={start_at}"]
-    cmd += [url]
-    ok = run_cmd(cmd)
+def play_youtube_persistent(url, start_at=None):
+    ok = _mpv_loadfile(url, start_at=start_at)
     if ok:
-        return True
+        res = _wait_until_idle(max_wait=None)
+        return res == "idle"
 
+    # fallback igual que antes (yt-dlp)
     log.warning("[YOUTUBE] mpv directo falló, intentando fallback yt-dlp: %s", url)
     ytdlp = shutil.which("yt-dlp") or shutil.which("youtube-dl")
     if not ytdlp:
@@ -439,12 +479,11 @@ def play_youtube(url, duration=None, start_at=None):
             out = subprocess.check_output([ytdlp, "-f", fmt, "--get-url", url], text=True, stderr=subprocess.STDOUT, timeout=20)
             urls = [l.strip() for l in out.splitlines() if l.strip()]
             for du in urls:
-                cmd2 = MPV_BASE_OPTS.copy()
-                if start_at:
-                    cmd2 += [f"--start={start_at}"]
-                cmd2 += [du]
-                if run_cmd(cmd2):
-                    return True
+                ok2 = _mpv_loadfile(du, start_at=start_at)
+                if ok2:
+                    res = _wait_until_idle(max_wait=None)
+                    if res == "idle":
+                        return True
         except Exception:
             continue
 
@@ -452,8 +491,8 @@ def play_youtube(url, duration=None, start_at=None):
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         out_pattern = str(CACHE_DIR / "%(id)s.%(ext)s")
         dl_cmd = [ytdlp, "-f", "bv*+ba/b", "-o", out_pattern, url]
-        ok = subprocess.call(dl_cmd) == 0
-        if ok:
+        okd = subprocess.call(dl_cmd) == 0
+        if okd:
             try:
                 vid = subprocess.check_output([ytdlp, "--get-id", url], text=True).strip()
             except Exception:
@@ -462,11 +501,11 @@ def play_youtube(url, duration=None, start_at=None):
                 for ext in ("mp4", "mkv", "webm"):
                     cand = CACHE_DIR / f"{vid}.{ext}"
                     if cand.exists():
-                        return play_video(str(cand), duration=duration, start_at=start_at)
+                        return play_video_persistent(str(cand), start_at=start_at)
             files = list(CACHE_DIR.glob("*.*"))
             if files:
                 files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                return play_video(str(files[0]), duration=duration, start_at=start_at)
+                return play_video_persistent(str(files[0]), start_at=start_at)
     except Exception as e:
         log.error("[YOUTUBE] fallback descarga error: %s", e)
 
@@ -577,7 +616,6 @@ def normalize_playlist(data):
     if not isinstance(data, dict):
         return {"items": []}
 
-    # compat list->items
     if "items" not in data and "list" in data:
         data["items"] = data.pop("list")
 
@@ -623,7 +661,6 @@ def persist_remote_playlist(playlist: dict):
             log.error("[PLAYLIST] Error overwrite local: %s", e)
 
 def choose_boot_playlist_file() -> Path:
-    # Si ya existe la remota, úsala; si no, usa la local
     try:
         if REMOTE_PLAYLIST_FILE.exists():
             return REMOTE_PLAYLIST_FILE
@@ -632,7 +669,7 @@ def choose_boot_playlist_file() -> Path:
     return LOCAL_PLAYLIST_FILE
 
 # ----------------------------
-# Prefetch YouTube
+# Prefetch YouTube (igual que antes)
 # ----------------------------
 def maybe_prefetch(item, publish_fn=None):
     if item.get("kind") != "youtube" or not item.get("prefetch"):
@@ -688,12 +725,11 @@ def handle_item_play(item, retries, publish_fn=None, show_time=False):
     start = it.get("start_at")
 
     full_path = build_media_path(src, kind)
-
-    # para que status/nowplaying tenga algo útil
     set_state(current_src=full_path or "ninguno", paused=False)
 
     for _attempt in range(int(retries or 0) + 1):
         if stop_all_event.is_set():
+            _mpv_stop_playback()
             return "stopped"
 
         payload_start = {"event": "start", "item": it}
@@ -704,11 +740,11 @@ def handle_item_play(item, retries, publish_fn=None, show_time=False):
 
         ok = True
         if kind == "image":
-            ok = play_image(full_path, dur or 8)
+            ok = play_image_persistent(full_path, dur or 8)
         elif kind == "video":
-            ok = play_video(full_path, duration=dur, start_at=start)
+            ok = play_video_persistent(full_path, start_at=start)
         elif kind == "youtube":
-            ok = play_youtube(full_path, duration=dur, start_at=start)
+            ok = play_youtube_persistent(full_path, start_at=start)
 
         payload_end = {"event": "end", "item": it, "ok": bool(ok)}
         if show_time:
@@ -729,6 +765,9 @@ def loop_thread_fn(mqttc):
     last_mtime = None
     tv_state_on = False
 
+    # asegurar mpv desde el inicio para evitar flashes
+    _ensure_mpv_running()
+
     while True:
         loop_should_run.wait()
         set_state(loop_running=True, mode=MODE_LOOP)
@@ -738,7 +777,6 @@ def loop_thread_fn(mqttc):
         playlist = st.get("loop_playlist")
         path_str = st.get("loop_playlist_file")
 
-        # Si no hay file seteado todavía, usa la mejor opción de arranque
         if not path_str and playlist is None:
             path_str = str(choose_boot_playlist_file())
             set_state(loop_playlist_file=path_str)
@@ -746,7 +784,6 @@ def loop_thread_fn(mqttc):
         try:
             if playlist is None and path_str:
                 path = Path(path_str).expanduser()
-                # si viene relativo, lo hacemos relativo a PROJECT_DIR
                 if not path.is_absolute():
                     path = (PROJECT_DIR / path).resolve()
                 playlist = load_playlist_from_file(path)
@@ -794,7 +831,6 @@ def loop_thread_fn(mqttc):
                     time.sleep(30)
                 continue
 
-        # Reproducción del ciclo
         for it in items:
             if not loop_should_run.is_set():
                 break
@@ -818,9 +854,13 @@ def loop_thread_fn(mqttc):
                 break
 
             if black_between > 0 and loop_should_run.is_set():
-                time.sleep(black_between)
+                # sin “home”: mpv sigue abierto, solo hacemos pausa antes del siguiente item
+                t0 = time.time()
+                while (time.time() - t0) < black_between:
+                    if stop_all_event.is_set():
+                        break
+                    time.sleep(0.1)
 
-        # Autorecarga si cambió el archivo en disco
         try:
             if path is not None and path.exists():
                 mtime = path.stat().st_mtime
@@ -948,10 +988,8 @@ def _coerce_payload_to_dict(payload_text: str):
         obj = json.loads(payload_text)
         if isinstance(obj, dict):
             return obj
-        # si mandan string JSON, o lista, etc.
         return {"action": str(obj)}
     except Exception:
-        # payload plano: "pause"
         return {"action": payload_text}
 
 def main():
@@ -960,6 +998,9 @@ def main():
         sys.exit(1)
 
     _install_lockfile()
+
+    # Arrancar mpv persistente desde el inicio (evita “home flash” entre items)
+    _ensure_mpv_running()
 
     try:
         import paho.mqtt.client as mqtt
@@ -971,21 +1012,17 @@ def main():
     if MQTT_USER and MQTT_PASS:
         mqttc.username_pw_set(MQTT_USER, MQTT_PASS)
 
-    # Last Will (retain=True para que el server sepa que quedó offline)
     mqttc.will_set(TOPIC_STATUS, json.dumps({"event": "offline", "client_id": CLIENT_ID}), qos=1, retain=True)
 
     def on_connect(client, userdata, flags, rc):
-        # rc=0 ok, rc=5 not authorized (ojo si ves rc=5!)
         log.info("[MQTT] connected rc=%s", rc)
         if rc == 0:
             mqtt_connected_evt.set()
             set_state(mqtt_connected=True)
             client.subscribe(TOPIC_CMD, qos=1)
             publish_status_snapshot(client, event="online")
-            # opcional: "ready" también (retain)
             publish(client, TOPIC_STATUS, {"event": "ready", "client_id": CLIENT_ID, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, retain=True)
         else:
-            # No autorizado, etc. Seguimos offline reproduciendo local, pero dejamos log claro.
             mqtt_connected_evt.clear()
             set_state(mqtt_connected=False)
             log.warning("[MQTT] conexión NO exitosa rc=%s (seguimos reproduciendo offline)", rc)
@@ -994,7 +1031,6 @@ def main():
         log.warning("[MQTT] disconnected rc=%s", rc)
         mqtt_connected_evt.clear()
         set_state(mqtt_connected=False)
-        # no matamos el programa: sigue el loop offline
         publish_status_snapshot(client, event="disconnected")
 
     def on_message(client, userdata, msg):
@@ -1008,7 +1044,6 @@ def main():
 
         action = (data.get("action") or "").strip()
         if not action:
-            # compat: {"state":"on"} / {"power":"off"} => tv.power
             stv = data.get("state") or data.get("power")
             if isinstance(stv, str) and stv.lower() in ("on", "off"):
                 action = "tv.power"
@@ -1018,9 +1053,6 @@ def main():
 
         action_l = action.lower().strip()
 
-        # ----------------------------
-        # Player controls (pause/resume)
-        # ----------------------------
         pause_actions = {"pause", "play.pause", "player.pause", "video.pause"}
         resume_actions = {"resume", "play.resume", "play.play", "player.play", "video.resume"}
         toggle_actions = {"toggle", "toggle_pause", "pause.toggle", "play.toggle_pause", "play.pause_toggle"}
@@ -1044,7 +1076,6 @@ def main():
             return
 
         if action_l in {"play.next", "loop.next", "next"}:
-            # Saltar item actual sin detener loop
             stop_all_event.set()
             time.sleep(0.1)
             stop_all_event.clear()
@@ -1055,14 +1086,9 @@ def main():
             publish_status_snapshot(client, event="status")
             return
 
-        # ----------------------------
-        # Loop / Playlist
-        # ----------------------------
         if action_l in {"loop.start", "loop.set", "playlist.set"}:
-            # Detener lo actual y arrancar loop
             stop_all_event.set()
             loop_should_run.clear()
-
             set_state(mode=MODE_LOOP, paused=False)
 
             playlist = data.get("playlist")
@@ -1070,14 +1096,9 @@ def main():
 
             if playlist:
                 playlist = normalize_playlist(playlist)
-
-                # persistir playlist enviada por MQTT
                 persist_remote_playlist(playlist)
-
-                # usar remota como fuente para loop (para que al reiniciar también siga)
                 set_state(loop_playlist=None, loop_playlist_file=str(REMOTE_PLAYLIST_FILE))
             else:
-                # si mandan playlist_file, úsala; si no, mantener la actual (o boot)
                 if playlist_file:
                     pf = Path(str(playlist_file)).expanduser()
                     if not pf.is_absolute():
@@ -1090,9 +1111,7 @@ def main():
                     else:
                         set_state(loop_playlist=None)
 
-            # forzar que el loop thread recargue ya
             schedule_change_event.set()
-
             stop_all_event.clear()
             loop_should_run.set()
 
@@ -1103,13 +1122,13 @@ def main():
         if action_l == "loop.stop":
             loop_should_run.clear()
             stop_all_event.set()
+            _mpv_stop_playback()
             set_state(loop_running=False, current_src="ninguno", paused=False)
             publish(client, TOPIC_STATUS, {"event": "loop.stopped", "src": "ninguno"}, retain=False)
             publish_status_snapshot(client, event="status")
             return
 
         if action_l == "loop.reload":
-            # recarga rompiendo el loop actual
             schedule_change_event.set()
             stop_all_event.set()
             time.sleep(0.1)
@@ -1143,9 +1162,6 @@ def main():
             publish(client, TOPIC_STATUS, {"event": "loop.schedule.set", "enabled": enabled, "start_time": start_time, "end_time": end_time}, retain=False)
             return
 
-        # ----------------------------
-        # Scheduler
-        # ----------------------------
         if action_l == "scheduler.add":
             playlist_name = data.get("name")
             start_time = data.get("start_time")
@@ -1192,18 +1208,12 @@ def main():
             publish(client, TOPIC_STATUS, {"event": "scheduler.list", "scheduled_playlists": st.get("scheduled_playlists", []), "total": len(st.get("scheduled_playlists", [])), "active": st.get("active_scheduled_playlist")}, retain=False)
             return
 
-        # ----------------------------
-        # TV power
-        # ----------------------------
         if action_l == "tv.power":
             state_tv = (data.get("state") or "").lower()
             ok, detail = tv_power_control(state_tv)
             publish(client, TOPIC_STATUS, {"event": "tv.power", "state": state_tv, "ok": bool(ok), "detail": detail}, retain=False)
             return
 
-        # ----------------------------
-        # Direct play
-        # ----------------------------
         if action_l == "play.once":
             item = data.get("item")
             if not item or not isinstance(item, dict):
@@ -1229,12 +1239,12 @@ def main():
 
         if action_l == "play.stop":
             stop_all_event.set()
+            _mpv_stop_playback()
             set_state(current_item=None, current_src="ninguno", paused=False)
             publish(client, TOPIC_STATUS, {"event": "play.stopped", "src": "ninguno"}, retain=False)
             publish_status_snapshot(client, event="status")
             return
 
-        # Unknown
         publish(client, TOPIC_STATUS, {"event": "error", "error": f"unknown action: {action}"}, retain=False)
 
     mqttc.on_connect = on_connect
@@ -1243,22 +1253,15 @@ def main():
 
     mqttc.reconnect_delay_set(min_delay=1, max_delay=30)
 
-    # ----------------------------
-    # Start threads (playback siempre corre)
-    # ----------------------------
     threading.Thread(target=lambda: loop_thread_fn(mqttc), daemon=True).start()
     threading.Thread(target=lambda: direct_thread_fn(mqttc), daemon=True).start()
     threading.Thread(target=lambda: scheduler_thread_fn(mqttc), daemon=True).start()
     threading.Thread(target=lambda: heartbeat_thread_fn(mqttc), daemon=True).start()
 
-    # Arrancar loop desde playlist “mejor” disponible (remote si existe, si no local)
     boot_file = choose_boot_playlist_file()
     set_state(loop_playlist=None, loop_playlist_file=str(boot_file))
     loop_should_run.set()
 
-    # ----------------------------
-    # MQTT connect (NO matamos app si falla; sigue offline)
-    # ----------------------------
     log.info("Iniciando MQTT (connect_async) hacia %s:%s ...", MQTT_HOST, MQTT_PORT)
     try:
         mqttc.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
@@ -1266,9 +1269,6 @@ def main():
     except Exception as e:
         log.error("No se pudo iniciar MQTT async: %s (seguimos offline reproduciendo)", e)
 
-    # ----------------------------
-    # Señales para salir limpio
-    # ----------------------------
     def _shutdown(_sig=None, _frame=None):
         log.warning("Cerrando PABS-TV...")
         try:
@@ -1294,7 +1294,6 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    # Mantener proceso vivo (playback+MQTT trabajan en threads)
     while True:
         time.sleep(1)
 
