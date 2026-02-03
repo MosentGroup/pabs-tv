@@ -708,4 +708,4 @@ print_success "Listo"
 
 echo ""
 print_info "IMPORTANTE: El ajuste de overscan puede requerir reiniciar el equipo para verse reflejado."
-print_info "Si acabas de instalar y ves franjas, reinicia la Raspberry: sudo reboot"
+print_info "Si acabas de instalar y ves franjas, reinicia la Raspberry: sudo reboot"              
